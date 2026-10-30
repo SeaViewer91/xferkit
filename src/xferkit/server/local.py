@@ -7,6 +7,7 @@ Layout under ``root``::
     uploads/<upload_id>/parts/<n>.json    marker of a verified part (size, sha256)
     uploads/<upload_id>/parts/<n>.lock    present while part n is being written
     uploads/<upload_id>/.completing       present while the upload is being completed
+    tokens/<client_token>                 upload id created for that client token
     files/<upload_id>/<filename>          assembled file after completion
     records/<upload_id>.json              completion record
 
@@ -31,9 +32,10 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import time
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -58,6 +60,7 @@ _WINDOWS_RESERVED = {
     *(f"LPT{i}" for i in range(1, 10)),
 }  # fmt: skip
 _MAX_NAME_BYTES = 200
+_HOSTNAME = socket.gethostname().replace(" ", "_") or "localhost"
 
 
 def validate_upload_id(upload_id: object) -> str:
@@ -124,25 +127,59 @@ def _read_json(path: Path) -> Any:
         return json.load(fh)
 
 
+def _lock_owner_is_dead(content: str) -> bool:
+    """Whether a lock was left behind by a process that no longer exists.
+
+    Locks record ``"<hostname> <pid> <timestamp>"``. The owner can only be
+    checked when it ran on this host; locks from other hosts (shared network
+    storage) fall back to the age-based timeout.
+    """
+    if os.name == "nt":  # os.kill(pid, 0) would terminate the process on Windows
+        return False
+    fields = content.split()
+    if len(fields) < 2 or fields[0] != _HOSTNAME:
+        return False
+    try:
+        pid = int(fields[1])
+    except ValueError:
+        return False
+    if pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:  # PermissionError: alive but owned by another user
+        return False
+    return False
+
+
 def _try_lock(path: Path, stale_after: float | None) -> bool:
-    """Create ``path`` exclusively. A lock older than ``stale_after`` seconds is
-    considered abandoned (its owner crashed) and is taken over."""
+    """Create ``path`` exclusively.
+
+    An existing lock is taken over when its owner process has died (e.g. a
+    server worker was killed mid-upload) or when it is older than
+    ``stale_after`` seconds.
+    """
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
     except FileExistsError:
         if stale_after is None:
             return False
         try:
+            content = path.read_text(encoding="utf-8", errors="replace")
             age = time.time() - path.stat().st_mtime
         except FileNotFoundError:
             return _try_lock(path, None)
-        if age <= stale_after:
+        if not (_lock_owner_is_dead(content) or age > stale_after):
             return False
-        with contextlib.suppress(FileNotFoundError):
-            path.unlink()
+        with contextlib.suppress(FileNotFoundError, OSError):
+            # Only remove the lock we inspected, not one created in the meantime.
+            if path.read_text(encoding="utf-8", errors="replace") == content:
+                path.unlink()
         return _try_lock(path, None)
     with os.fdopen(fd, "w") as fh:
-        fh.write(f"{os.getpid()} {time.time():.3f}\n")
+        fh.write(f"{_HOSTNAME} {os.getpid()} {time.time():.3f}\n")
     return True
 
 
@@ -272,6 +309,8 @@ class LocalStorage(StorageBackend):
     DATA_FILE = "data"
     PARTS_DIR = "parts"
     COMPLETING_LOCK = ".completing"
+    STAGING_PREFIX = ".creating-"
+    TRASH_PREFIX = ".trash-"
 
     def __init__(
         self,
@@ -288,7 +327,8 @@ class LocalStorage(StorageBackend):
         self._uploads = self.root / "uploads"
         self._files = self.root / "files"
         self._records = self.root / "records"
-        for directory in (self._uploads, self._files, self._records):
+        self._tokens = self.root / "tokens"
+        for directory in (self._uploads, self._files, self._records, self._tokens):
             directory.mkdir(parents=True, exist_ok=True)
 
     def __repr__(self) -> str:
@@ -305,18 +345,21 @@ class LocalStorage(StorageBackend):
     # ------------------------------------------------------------------ sessions
 
     def create(self, session: UploadSession) -> None:
+        # Build the session in a staging directory and rename it into place, so a
+        # crash never leaves a half-created session where clients can see it.
         directory = self._dir(session.upload_id)
+        if directory.exists():
+            raise UploadConflict(f"upload {session.upload_id!r} already exists")
+        staging = self._uploads / f"{self.STAGING_PREFIX}{session.upload_id}"
         try:
-            directory.mkdir()
-        except FileExistsError:
-            raise UploadConflict(f"upload {session.upload_id!r} already exists") from None
-        try:
-            (directory / self.PARTS_DIR).mkdir()
-            with open(directory / self.DATA_FILE, "wb") as fh:
+            staging.mkdir()
+            (staging / self.PARTS_DIR).mkdir()
+            with open(staging / self.DATA_FILE, "wb") as fh:
                 fh.truncate(session.size)  # sparse where the filesystem supports it
-            _atomic_write_json(directory / self.SESSION_FILE, session.to_dict(), fsync=self.fsync)
+            _atomic_write_json(staging / self.SESSION_FILE, session.to_dict(), fsync=self.fsync)
+            os.rename(staging, directory)
         except BaseException:
-            shutil.rmtree(directory, ignore_errors=True)
+            shutil.rmtree(staging, ignore_errors=True)
             raise
 
     def load(self, upload_id: str) -> UploadSession:
@@ -336,7 +379,17 @@ class LocalStorage(StorageBackend):
                 continue
 
     def delete(self, upload_id: str) -> None:
-        shutil.rmtree(self._dir(upload_id), ignore_errors=True)
+        self._discard(self._dir(upload_id))
+
+    def _discard(self, directory: Path) -> None:
+        """Remove a session directory. It is renamed out of the way first, so a
+        crash mid-removal never leaves a half-deleted session under a valid id."""
+        trash = self._uploads / f"{self.TRASH_PREFIX}{directory.name}-{secrets.token_hex(4)}"
+        try:
+            os.rename(directory, trash)
+        except FileNotFoundError:
+            return
+        shutil.rmtree(trash, ignore_errors=True)
 
     # ------------------------------------------------------------------ parts
 
@@ -417,7 +470,7 @@ class LocalStorage(StorageBackend):
             with contextlib.suppress(FileNotFoundError):
                 lock.unlink()
             raise
-        shutil.rmtree(directory, ignore_errors=True)
+        self._discard(directory)
         return completed
 
     def _finalize_locked(
@@ -479,6 +532,7 @@ class LocalStorage(StorageBackend):
             created_at=session.created_at,
             completed_at=time.time(),
             metadata=dict(session.metadata),
+            chunk_size=session.chunk_size,
         )
         record = completed.to_dict()
         record["path"] = target.relative_to(self.root).as_posix()
@@ -502,3 +556,84 @@ class LocalStorage(StorageBackend):
             self._record_path(upload_id).unlink()
         if remove_file and completed is not None:
             shutil.rmtree(self._files / upload_id, ignore_errors=True)
+
+    # ------------------------------------------------------------------ client tokens
+
+    def lookup_token(self, token: str) -> str | None:
+        try:
+            value = (self._tokens / validate_upload_id(token)).read_text(encoding="utf-8").strip()
+        except (FileNotFoundError, UploadNotFound):
+            return None
+        return value if _ID_RE.match(value) else None
+
+    def bind_token(self, token: str, upload_id: str, *, replace: bool = False) -> str:
+        path = self._tokens / validate_upload_id(token)
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+        tmp.write_text(validate_upload_id(upload_id), encoding="utf-8")
+        try:
+            if replace:
+                os.replace(tmp, path)
+                return upload_id
+            try:
+                os.link(tmp, path)  # atomic, fails if the token is already bound
+            except FileExistsError:
+                return self.lookup_token(token) or upload_id
+            except OSError:  # filesystem without hard links (FAT, some SMB mounts)
+                try:
+                    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                except FileExistsError:
+                    return self.lookup_token(token) or upload_id
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(upload_id)
+            return upload_id
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                tmp.unlink()
+
+    def prune_tokens(self, is_live: Callable[[str], bool]) -> int:
+        removed = 0
+        for path in self._tokens.iterdir():
+            if path.name.startswith("."):
+                continue
+            upload_id = self.lookup_token(path.name)
+            if upload_id is None or not is_live(upload_id):
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+                removed += 1
+        return removed
+
+    # ------------------------------------------------------------------ garbage
+
+    def collect_garbage(self, *, older_than: float) -> int:
+        """Remove crash leftovers: half-removed (``.trash-*``) and half-created
+        (``.creating-*``) session directories, session directories without
+        ``session.json`` and orphaned ``*.tmp`` files."""
+        cutoff = time.time() - older_than
+        removed = 0
+
+        def old(path: Path) -> bool:
+            try:
+                return path.stat().st_mtime < cutoff
+            except FileNotFoundError:
+                return False
+
+        for path in self._uploads.iterdir():
+            if path.name.startswith(self.TRASH_PREFIX):  # never in use once renamed
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+                continue
+            half_created = path.name.startswith(self.STAGING_PREFIX) or (
+                path.is_dir()
+                and _ID_RE.match(path.name) is not None
+                and not (path / self.SESSION_FILE).exists()
+            )
+            if half_created and old(path):
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        for directory in (self._records, self._tokens):
+            for path in directory.glob(".*.tmp"):
+                if old(path):
+                    with contextlib.suppress(FileNotFoundError):
+                        path.unlink()
+                    removed += 1
+        return removed

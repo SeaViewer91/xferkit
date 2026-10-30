@@ -69,6 +69,7 @@ result = upload_file(
     headers={"Authorization": "Bearer ..."},
     concurrency=6,
     state_dir="~/.cache/xferkit",      # enables resume across runs
+    idempotency_key="coastal/survey_2026.tif",  # re-running never uploads a second copy
 )
 print(result.upload_id, result.composite_checksum)
 
@@ -123,6 +124,10 @@ source .venv/bin/activate
 pytest
 ruff check src tests && ruff format --check src tests
 ```
+
+Load test (thousands of ~10 MB images, 10 concurrent sessions, fault injection): see [benchmarks/load](benchmarks/load/README.md).
+
+The README is maintained in English and Korean ([README.ko.md](README.ko.md)); please update both when changing it.
 
 ## License
 

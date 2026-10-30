@@ -81,6 +81,9 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE")
     up.add_argument("-H", "--header", action="append", default=[], metavar="'NAME: VALUE'")
     up.add_argument("--upload-id", help="resume this upload session")
+    up.add_argument(
+        "--idempotency-key", help="re-running with the same key never uploads a second copy"
+    )
     up.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     up.add_argument("--checksum", action="store_true", help="also verify a whole-file sha256")
     up.add_argument("-q", "--quiet", action="store_true")
@@ -116,6 +119,7 @@ def main(argv: list[str] | None = None) -> int:
                 filename=args.filename,
                 metadata=_metadata(args.meta),
                 upload_id=args.upload_id,
+                idempotency_key=args.idempotency_key,
                 progress=printer,
                 headers=_headers(args.header),
                 chunk_size=args.chunk_size,

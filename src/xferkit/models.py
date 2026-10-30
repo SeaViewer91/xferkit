@@ -136,12 +136,15 @@ class CompletedUpload:
     created_at: float
     completed_at: float
     metadata: dict[str, str] = field(default_factory=dict)
+    chunk_size: int = 0  # 0 for records written by xferkit < 0.1.0 final
 
     def to_dict(self, *, include_path: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
             "upload_id": self.upload_id,
             "filename": self.filename,
             "size": self.size,
+            "chunk_size": self.chunk_size,
+            "total_parts": total_parts(self.size, self.chunk_size) if self.chunk_size else None,
             "composite_checksum": self.composite_checksum,
             "checksum": self.checksum,
             "created_at": self.created_at,
@@ -164,4 +167,5 @@ class CompletedUpload:
             created_at=float(data["created_at"]),
             completed_at=float(data["completed_at"]),
             metadata={str(k): str(v) for k, v in (data.get("metadata") or {}).items()},
+            chunk_size=int(data.get("chunk_size") or 0),
         )

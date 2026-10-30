@@ -15,7 +15,8 @@ Content-Type: application/json
   "size": 53687091200,
   "chunk_size": 16777216,          // optional; server chooses if omitted
   "checksum": "sha256=<64 hex>",   // optional whole-file checksum
-  "metadata": {"project": "coastal"}  // optional, string values only
+  "metadata": {"project": "coastal"},  // optional, string values only
+  "client_token": "q3Z...random"       // optional, recommended (see below)
 }
 ```
 
@@ -34,6 +35,14 @@ Content-Type: application/json
   "metadata": {"project": "coastal"}
 }
 ```
+
+**Idempotent creation.** `client_token` (8–128 chars of `[A-Za-z0-9_-]`) is a
+random id the client generates and stores *before* sending the request. If the
+same token is sent again, the server does not create a second session: it
+answers `200 OK` with the existing upload's status (or its completion record
+with `"state": "completed"`). This lets a client that crashed or lost the
+response find its session again, and makes retrying this `POST` safe. Reusing a
+token for a different file (other `filename` or `size`) is a `409`.
 
 Parts are numbered `0 .. total_parts-1`. Part `n` covers bytes
 `n*chunk_size .. min((n+1)*chunk_size, size) - 1`; every part except the last
@@ -79,6 +88,12 @@ GET /uploads/{upload_id}
   "received_bytes": 67108864
 }
 ```
+
+If the upload has already been completed, the same endpoint returns the
+completion record (see below) with `"state": "completed"` plus `chunk_size` and
+`total_parts`. A client that crashed after the server completed the upload but
+before it saw the response uses this to finish verification instead of
+uploading the file again.
 
 ## 4. Complete
 

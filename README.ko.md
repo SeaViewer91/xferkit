@@ -69,6 +69,7 @@ result = upload_file(
     headers={"Authorization": "Bearer ..."},
     concurrency=6,
     state_dir="~/.cache/xferkit",      # 실행이 끊겨도 이어서 올릴 수 있게 함
+    idempotency_key="coastal/survey_2026.tif",  # 다시 실행해도 같은 파일을 두 번 올리지 않음
 )
 print(result.upload_id, result.composite_checksum)
 
@@ -123,6 +124,8 @@ source .venv/bin/activate
 pytest
 ruff check src tests && ruff format --check src tests
 ```
+
+부하 테스트(약 10MB 이미지 수천 장, 동시 세션 10개, 장애 주입)는 [benchmarks/load](benchmarks/load/README.md)를 참고하세요.
 
 ## 라이선스
 

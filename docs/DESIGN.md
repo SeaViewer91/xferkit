@@ -29,6 +29,9 @@ uploads/<id>/data              pre-sized (sparse) file
 uploads/<id>/parts/<n>.json    marker: part n verified (size, sha256)
 uploads/<id>/parts/<n>.lock    part n is being written
 uploads/<id>/.completing       completion in progress
+uploads/.creating-<id>/        session being created (renamed into place)
+uploads/.trash-<id>-<rand>/    session being removed
+tokens/<client_token>          upload id created for that token
 files/<id>/<filename>          result
 records/<id>.json              completion record
 ```
@@ -55,8 +58,14 @@ without a database or an in-process lock.
 - `finalize`: take `.completing` (O_EXCL), *then* check for any part locks.
 
 Whichever happens second sees the other's lock, so a part can never be written
-into a file that is being moved. Locks older than a timeout are treated as left
-behind by a crashed process and taken over.
+into a file that is being moved.
+
+Each lock records `<hostname> <pid> <time>`. A lock is taken over immediately
+when its owner process on the same host no longer exists (a worker killed
+mid-part), and otherwise after a timeout (owners on other hosts sharing the
+storage). Without the liveness check, a server crash blocked the affected
+parts for the full timeout; the load test (S4) found this. On Windows only the
+timeout applies, because `os.kill(pid, 0)` would terminate the process there.
 
 ### Re-uploading a part
 
@@ -75,10 +84,55 @@ sends it again; a half-written region is never reported as received.
   creation; the server re-reads the assembled file and verifies it before
   completing. This costs one extra full read on each side.
 
+### Completed uploads stay addressable
+
+After completion the session directory is removed, but the status endpoint
+still answers for the id with the completion record (`state: "completed"`).
+If a client dies after the server completed the upload but before it saw the
+response, re-running it verifies the existing upload instead of creating a
+duplicate (and firing `on_complete` twice). The load test (S4) found this.
+
+### Idempotent session creation
+
+A client crash between "server created the session" and "client recorded the
+upload id" used to leave an orphaned session behind on every re-run (cleaned
+only when it expired). The client now writes a random `client_token` to its
+journal before sending the create request; the server binds the token to the
+upload id (`tokens/<token>`, created with an atomic hard link) and answers a
+repeated token with the existing upload. Token bindings are pruned by
+`cleanup_expired()` once their upload no longer exists. The load test (S4)
+found this.
+
+Two server-side crash windows are closed the same way:
+
+- The token is bound *before* the session is created. A crash in between
+  leaves a token pointing at nothing, and the retry creates the session.
+- A session is built in `uploads/.creating-<id>/` and renamed into place, so a
+  crash mid-creation never exposes a half-written session.
+- A finished or aborted session is renamed to `uploads/.trash-<id>-*` before it
+  is deleted, so a crash mid-removal never leaves a half-deleted directory
+  under a valid id.
+
+Invariant: every `uploads/<id>/` directory is a complete, live session.
+Everything else (`.creating-*`, `.trash-*`, stray `*.tmp`) is crash debris,
+invisible to clients and removed by `cleanup_expired()` (staging directories
+only after `garbage_age`, 1 hour, since they may still be in progress).
+
+### Exactly-once from the application's point of view
+
+The SDK removes its journal when `upload()` returns. If the *application*
+crashes after that but before it records the result, a re-run cannot know the
+file was already uploaded. `upload(..., idempotency_key=...)` closes this gap:
+the key (any string meaningful to the application) is hashed into the
+`client_token`, so the same key always maps to the same server-side upload,
+pending or completed. The load test uses one key per file and session; it
+found a duplicate in this window before the option existed.
+
 ## Client resume
 
 - **Upload:** an append-only journal (`state_dir/upload-<hash>.journal`)
-  holds the session id and one line per acknowledged part with its digest.
+  holds the client token, the session id and one line per acknowledged part
+  with its digest.
   Appending a line per part is O(1); rewriting a JSON document per part would
   be O(n²) for a 10 000-part upload. The journal is only reused if the file's
   path, size and mtime are unchanged. The server's status endpoint is the

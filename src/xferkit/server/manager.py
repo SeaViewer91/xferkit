@@ -109,6 +109,7 @@ class UploadManager:
         self.verify_checksum = verify_checksum
         self.max_metadata_bytes = max_metadata_bytes
         self.on_complete = on_complete
+        self.garbage_age = 3600.0  # seconds before crash leftovers are collected
         self._id_factory = id_factory
         self._clock = clock
 
@@ -123,7 +124,35 @@ class UploadManager:
         checksum: str | None = None,
         metadata: dict[str, str] | None = None,
     ) -> UploadSession:
-        """Open a new upload session.
+        """Open a new upload session (see :meth:`open_upload` for the idempotent
+        variant used by the HTTP integration).
+
+        Args:
+            filename: Original file name (stored as given; sanitised only when
+                used as a path).
+            size: Exact file size in bytes.
+            chunk_size: Requested part size. ``None`` lets the server choose.
+            checksum: Optional whole-file checksum ``sha256=<hex>``, verified on
+                completion when ``verify_checksum`` is enabled.
+            metadata: Free-form string key/value pairs kept with the upload.
+        """
+        session = self._new_session(
+            filename, size, chunk_size=chunk_size, checksum=checksum, metadata=metadata
+        )
+        self.storage.create(session)
+        logger.debug("created upload %s (%s, %d bytes)", session.upload_id, filename, size)
+        return session
+
+    def _new_session(
+        self,
+        filename: str,
+        size: int,
+        *,
+        chunk_size: int | None = None,
+        checksum: str | None = None,
+        metadata: dict[str, str] | None = None,
+    ) -> UploadSession:
+        """Validate the request and build (but not store) a session.
 
         Args:
             filename: Original file name (stored as given; sanitised only when
@@ -145,7 +174,7 @@ class UploadManager:
         metadata = self._validate_metadata(metadata)
 
         now = self._clock()
-        session = UploadSession(
+        return UploadSession(
             upload_id=validate_upload_id(self._id_factory()),
             filename=filename,
             size=size,
@@ -155,9 +184,71 @@ class UploadManager:
             checksum=checksum,
             metadata=metadata,
         )
+
+    def open_upload(
+        self,
+        filename: str,
+        size: int,
+        *,
+        chunk_size: int | None = None,
+        checksum: str | None = None,
+        metadata: dict[str, str] | None = None,
+        client_token: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create a session, idempotently when the client sends a token.
+
+        A client that generates ``client_token`` *before* the request and keeps
+        it can always find its session again, even if it crashed or lost the
+        response before learning the upload id. Re-sending the same token
+        returns the existing upload (pending or already completed) instead of
+        creating a second one.
+
+        Returns:
+            ``(state, created)`` where ``state`` is :meth:`describe` of the
+            upload and ``created`` tells whether a new session was made.
+        """
+        if client_token is not None:
+            try:
+                validate_upload_id(client_token)
+            except UploadNotFound:
+                raise InvalidRequest("client_token must match [A-Za-z0-9_-]{8,128}") from None
+            existing = self.storage.lookup_token(client_token)
+            if existing is not None:
+                try:
+                    state = self.describe(existing)
+                except UploadNotFound:  # expired or aborted: start over below
+                    pass
+                else:
+                    self._check_same_file(state, filename, size)
+                    return state, False
+
+        session = self._new_session(
+            filename, size, chunk_size=chunk_size, checksum=checksum, metadata=metadata
+        )
+        if client_token is not None:
+            # Bind the token *before* creating the session: if the server dies in
+            # between, the token points at nothing and the retry simply creates
+            # the session, instead of leaving an unreachable orphan behind.
+            winner = self.storage.bind_token(client_token, session.upload_id)
+            if winner != session.upload_id:
+                try:  # a concurrent request with the same token was faster
+                    state = self.describe(winner)
+                except UploadNotFound:  # ...or its binding is stale
+                    self.storage.bind_token(client_token, session.upload_id, replace=True)
+                else:
+                    self._check_same_file(state, filename, size)
+                    return state, False
         self.storage.create(session)
         logger.debug("created upload %s (%s, %d bytes)", session.upload_id, filename, size)
-        return session
+        return self.get_status(session.upload_id).to_dict(), True
+
+    @staticmethod
+    def _check_same_file(state: dict[str, Any], filename: str, size: int) -> None:
+        if state.get("size") != size or state.get("filename") != filename:
+            raise UploadConflict(
+                "client_token was already used for a different file",
+                details={"upload_id": state.get("upload_id")},
+            )
 
     # ------------------------------------------------------------------ query
 
@@ -173,6 +264,25 @@ class UploadManager:
         received = tuple(self.storage.received_parts(session))
         state = "completing" if self.storage.is_completing(session) else "pending"
         return UploadStatus(session=session, received_parts=received, state=state)
+
+    def describe(self, upload_id: str) -> dict[str, Any]:
+        """Protocol view of an upload, pending or completed.
+
+        Pending uploads return their status (``state`` = ``"pending"`` or
+        ``"completing"``). Completed uploads return their completion record with
+        ``state`` = ``"completed"``, so a client that lost the completion
+        response (crash, timeout) can recognise the upload as finished instead
+        of uploading the file a second time.
+        """
+        try:
+            return self.get_status(upload_id).to_dict()
+        except UploadExpired:
+            raise
+        except UploadNotFound:
+            completed = self.storage.get_completed(upload_id)
+            if completed is None:
+                raise
+            return {**completed.to_dict(), "state": "completed"}
 
     def get_completed(self, upload_id: str) -> CompletedUpload:
         completed = self.storage.get_completed(upload_id)
@@ -285,7 +395,18 @@ class UploadManager:
                 removed.append(session.upload_id)
         if removed:
             logger.info("removed %d expired upload(s)", len(removed))
+        self.storage.prune_tokens(self._upload_exists)
+        self.storage.collect_garbage(older_than=self.garbage_age)
         return removed
+
+    def _upload_exists(self, upload_id: str) -> bool:
+        if self.storage.get_completed(upload_id) is not None:
+            return True
+        try:
+            self.storage.load(upload_id)
+        except UploadNotFound:
+            return False
+        return True
 
     # ------------------------------------------------------------------ validation
 

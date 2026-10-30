@@ -9,7 +9,7 @@ backends (object storage, databases for metadata, ...) can be plugged in.
 from __future__ import annotations
 
 import abc
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Protocol
 
 from ..models import CompletedUpload, PartRecord, UploadSession
@@ -106,3 +106,27 @@ class StorageBackend(abc.ABC):
     @abc.abstractmethod
     def iter_sessions(self) -> Iterator[UploadSession]:
         """Iterate over all pending sessions (used for expiry cleanup)."""
+
+    # Idempotent creation. Optional: the defaults disable it (every create is new).
+
+    def lookup_token(self, token: str) -> str | None:
+        """Upload id bound to a client token, or ``None``."""
+        return None
+
+    def bind_token(self, token: str, upload_id: str, *, replace: bool = False) -> str:
+        """Bind a client token to an upload id.
+
+        Returns the id the token ends up bound to: ``upload_id``, or the id of
+        an earlier binding when ``replace`` is false and the token was taken by
+        a concurrent request.
+        """
+        return upload_id
+
+    def prune_tokens(self, is_live: Callable[[str], bool]) -> int:
+        """Delete token bindings whose upload no longer exists. Returns the count."""
+        return 0
+
+    def collect_garbage(self, *, older_than: float) -> int:
+        """Remove leftovers of crashed operations older than ``older_than``
+        seconds (half-created sessions, temp files). Returns the count."""
+        return 0

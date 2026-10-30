@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import secrets
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -82,6 +84,28 @@ def _parse_digest_lines(lines: list[str]) -> dict[int, bytes]:
             except ValueError:
                 continue
     return digests
+
+
+def _token_for_key(key: str) -> str:
+    """Map an application-level idempotency key to a protocol client token."""
+    digest = hashlib.sha256(b"xferkit-idempotency\0" + key.encode("utf-8")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _journal_upload_id(lines: list[str]) -> str | None:
+    upload_id = None
+    for line in lines:
+        key, _, value = line.partition(" ")
+        if key == "upload_id" and value:
+            upload_id = value  # the last one wins
+    return upload_id
+
+
+def _check_size(status: dict[str, Any], size: int) -> None:
+    if int(status["size"]) != size:
+        raise InvalidRequest(
+            f"upload {status.get('upload_id')} expects {status['size']} bytes, file has {size}"
+        )
 
 
 class AsyncUploader:
@@ -180,6 +204,7 @@ class AsyncUploader:
         filename: str | None = None,
         metadata: dict[str, str] | None = None,
         upload_id: str | None = None,
+        idempotency_key: str | None = None,
         progress: ProgressCallback | None = None,
     ) -> UploadResult:
         """Upload ``path`` and return once the server has assembled it.
@@ -190,6 +215,12 @@ class AsyncUploader:
             upload_id: Resume this specific session (e.g. one created in
                 another process). Without it, a journal in ``state_dir`` is
                 used to resume automatically.
+            idempotency_key: Any string that identifies this upload in *your*
+                application (e.g. ``"survey-42/DJI_0001.JPG"``). Uploading again
+                with the same key returns the existing upload, pending or
+                completed, instead of creating a second copy, even if your
+                process crashed after this call returned but before you
+                recorded the result.
             progress: Called with :class:`TransferProgress` after every part.
         """
         path = Path(path).expanduser()
@@ -207,11 +238,17 @@ class AsyncUploader:
         }
         digests: dict[int, bytes] = {}
         explicit = upload_id is not None
+        client_token = _token_for_key(idempotency_key) if idempotency_key is not None else None
 
         if upload_id is None and journal is not None:
             header, lines = journal.read()
-            if header and all(header.get(k) == v for k, v in journal_header.items()):
-                upload_id = header.get("upload_id")
+            if (
+                header
+                and all(header.get(k) == v for k, v in journal_header.items())
+                and (client_token is None or header.get("client_token") == client_token)
+            ):
+                upload_id = header.get("upload_id") or _journal_upload_id(lines)
+                client_token = header.get("client_token")
                 digests = _parse_digest_lines(lines)
 
         status: dict[str, Any] | None = None
@@ -223,35 +260,51 @@ class AsyncUploader:
                     raise
                 digests = {}
             else:
-                if int(status["size"]) != size:
-                    raise InvalidRequest(
-                        f"upload {upload_id} expects {status['size']} bytes, file has {size}"
-                    )
+                _check_size(status, size)
                 if explicit and journal is not None:
                     journal.start({**journal_header, "upload_id": upload_id})
         resumed = status is not None
 
         if status is None:
-            status = await self._create(path, filename, size, metadata)
-            upload_id = str(status["upload_id"])
+            # The token is recorded *before* the request, so a crash at any point
+            # (even before the response arrives) can find this session again: the
+            # server answers a repeated token with the existing upload.
+            client_token = client_token or secrets.token_urlsafe(18)
+            digests = {}
             if journal is not None:
-                journal.start({**journal_header, "upload_id": upload_id})
+                journal.start({**journal_header, "client_token": client_token})
+            status, created = await self._create(path, filename, size, metadata, client_token)
+            _check_size(status, size)
+            upload_id = str(status["upload_id"])
+            resumed = not created
+            if journal is not None:
+                journal.append(f"upload_id {upload_id}")
         assert upload_id is not None
 
-        chunk_size = int(status["chunk_size"])
-        count = total_parts(size, chunk_size)
-        received = {int(i) for i in status.get("received_parts", [])}
+        chunk_size = int(status.get("chunk_size") or 0)
+        count = total_parts(size, chunk_size) if chunk_size else 0
+        # The server may already have completed this upload, e.g. when an earlier
+        # run crashed before it saw the completion response. Verify it instead of
+        # uploading the file a second time.
+        already_completed = status.get("state") == "completed"
+        if already_completed:
+            received = set(range(count))
+        else:
+            received = {int(i) for i in status.get("received_parts", [])}
         tracker = ProgressTracker(size, progress)
         tracker.add(sum(min(chunk_size, size - i * chunk_size) for i in received))
 
         try:
-            missing = [i for i in range(count) if i not in received]
-            await self._send_parts(
-                path, upload_id, size, chunk_size, missing, digests, journal, tracker
-            )
-            response = await self._complete(
-                path, upload_id, size, chunk_size, digests, journal, tracker
-            )
+            if already_completed:
+                response = status
+            else:
+                missing = [i for i in range(count) if i not in received]
+                await self._send_parts(
+                    path, upload_id, size, chunk_size, missing, digests, journal, tracker
+                )
+                response = await self._complete(
+                    path, upload_id, size, chunk_size, digests, journal, tracker
+                )
 
             unknown = [i for i in range(count) if i not in digests]
             if unknown:
@@ -287,16 +340,30 @@ class AsyncUploader:
         return Journal(self.state_dir / f"upload-{key}.journal")
 
     async def _create(
-        self, path: Path, filename: str, size: int, metadata: dict[str, str] | None
-    ) -> dict[str, Any]:
-        body: dict[str, Any] = {"filename": filename, "size": size, "metadata": metadata or {}}
+        self,
+        path: Path,
+        filename: str,
+        size: int,
+        metadata: dict[str, str] | None,
+        client_token: str,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create the session; ``created`` is false when the server returned the
+        upload already bound to ``client_token``."""
+        body: dict[str, Any] = {
+            "filename": filename,
+            "size": size,
+            "metadata": metadata or {},
+            "client_token": client_token,
+        }
         if self.chunk_size is not None:
             body["chunk_size"] = self.chunk_size
         if self.send_checksum:
             body["checksum"] = format_checksum(await asyncio.to_thread(_sha256_file, path))
-        status = (await self._request("POST", self.base_url, json=body)).json()
+        # Retrying this POST is safe: the token makes it idempotent.
+        response = await self._request("POST", self.base_url, json=body)
+        status = response.json()
         status.setdefault("received_parts", [])
-        return status
+        return status, response.status_code == 201
 
     async def _send_parts(
         self,
@@ -412,10 +479,16 @@ def upload_file(
     filename: str | None = None,
     metadata: dict[str, str] | None = None,
     upload_id: str | None = None,
+    idempotency_key: str | None = None,
     progress: ProgressCallback | None = None,
     **options: Any,
 ) -> UploadResult:
     """Upload one file synchronously. ``options`` go to :class:`AsyncUploader`."""
     return Uploader(base_url, **options).upload(
-        path, filename=filename, metadata=metadata, upload_id=upload_id, progress=progress
+        path,
+        filename=filename,
+        metadata=metadata,
+        upload_id=upload_id,
+        idempotency_key=idempotency_key,
+        progress=progress,
     )

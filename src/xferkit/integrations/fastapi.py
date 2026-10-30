@@ -64,6 +64,14 @@ class CreateUploadRequest(BaseModel):
         default=None, description="Optional whole-file checksum, 'sha256=<hex>'"
     )
     metadata: dict[str, str] = Field(default_factory=dict)
+    client_token: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9_-]{8,128}$",
+        description=(
+            "Random id chosen by the client before sending. Re-sending the same token "
+            "returns the existing upload (200) instead of creating another one (201)."
+        ),
+    )
 
 
 def error_response(exc: XferkitError) -> JSONResponse:
@@ -108,26 +116,28 @@ def create_upload_router(
     @router.post(root, status_code=201, summary="Create an upload session")
     async def create_upload(body: CreateUploadRequest, request: Request) -> Response:
         try:
-            session = await run_in_threadpool(
-                manager.create_upload,
-                body.filename,
-                body.size,
-                chunk_size=body.chunk_size,
-                checksum=body.checksum,
-                metadata=body.metadata,
+            state, created = await run_in_threadpool(
+                lambda: manager.open_upload(
+                    body.filename,
+                    body.size,
+                    chunk_size=body.chunk_size,
+                    checksum=body.checksum,
+                    metadata=body.metadata,
+                    client_token=body.client_token,
+                )
             )
         except XferkitError as exc:
             return error_response(exc)
-        location = str(request.url_for(f"{_name(prefix)}_status", upload_id=session.upload_id))
-        return _json(session.to_dict(), 201, {"Location": location})
+        location = str(request.url_for(f"{_name(prefix)}_status", upload_id=state["upload_id"]))
+        return _json(state, 201 if created else 200, {"Location": location})
 
     @router.get("/{upload_id}", name=f"{_name(prefix)}_status", summary="Upload status")
     async def get_status(upload_id: str) -> Response:
         try:
-            status = await run_in_threadpool(manager.get_status, upload_id)
+            status = await run_in_threadpool(manager.describe, upload_id)
         except XferkitError as exc:
             return error_response(exc)
-        return _json(status.to_dict())
+        return _json(status)
 
     @router.put("/{upload_id}/parts/{index}", summary="Upload one part (raw request body)")
     async def put_part(upload_id: str, index: int, request: Request) -> Response:

@@ -249,3 +249,86 @@ def test_sync_api_and_cli(live_server, app, random_file, tmp_path, capsys):
     assert (
         cli_main(["download", f"{live_server.url}/files/missing", str(tmp_path / "m"), "-q"]) == 1
     )
+
+
+async def test_resume_after_crash_between_complete_and_ack(live_server, app, random_file, tmp_path):
+    """The server completed the upload but the client died before it saw the
+    response. Re-running must recognise the finished upload, not upload twice."""
+
+    class CrashAfterComplete(AsyncUploader):
+        async def _complete(self, *args, **kwargs):
+            await super()._complete(*args, **kwargs)
+            raise Stop
+
+    source = random_file("crash.bin", 300 * KiB)
+    base = f"{live_server.url}/uploads"
+    state = tmp_path / "state"
+    async with CrashAfterComplete(base, chunk_size=64 * KiB, state_dir=state) as uploader:
+        with pytest.raises(Stop):
+            await uploader.upload(source)
+    assert len(app.state.completed) == 1
+
+    async with AsyncUploader(base, state_dir=state) as uploader:
+        result = await uploader.upload(source)
+    assert result.resumed
+    assert result.upload_id == app.state.completed[0].upload_id
+    assert len(app.state.completed) == 1  # no second copy, on_complete ran once
+    assert not list(state.iterdir())
+
+    async with httpx.AsyncClient() as http:
+        status = (await http.get(f"{base}/{result.upload_id}")).json()
+    assert status["state"] == "completed"
+    assert status["chunk_size"] == 64 * KiB and status["total_parts"] == 5
+
+
+async def test_resume_after_crash_before_upload_id_is_known(
+    live_server, app, random_file, tmp_path
+):
+    """The client died right after creating the session, before it learned or
+    recorded the upload id. The re-run must reuse that session, not orphan it."""
+
+    class CrashAfterCreate(AsyncUploader):
+        async def _create(self, *args, **kwargs):
+            await super()._create(*args, **kwargs)
+            raise Stop  # the response is lost
+
+    source = random_file("orphan.bin", 300 * KiB)
+    base = f"{live_server.url}/uploads"
+    state = tmp_path / "state"
+    async with CrashAfterCreate(base, chunk_size=64 * KiB, state_dir=state) as uploader:
+        with pytest.raises(Stop):
+            await uploader.upload(source)
+
+    async with AsyncUploader(base, chunk_size=64 * KiB, state_dir=state) as uploader:
+        result = await uploader.upload(source)
+    assert result.resumed
+    store = app.state.completed[0].path.parents[2]
+    assert list((store / "uploads").iterdir()) == []  # no orphaned session
+    assert len(app.state.completed) == 1
+
+
+async def test_create_with_same_client_token_over_http(live_server):
+    base = f"{live_server.url}/uploads"
+    body = {"filename": "t.bin", "size": 10, "client_token": "tok_http_000001"}
+    async with httpx.AsyncClient() as http:
+        first = await http.post(base, json=body)
+        second = await http.post(base, json=body)
+        bad = await http.post(base, json={**body, "client_token": "no spaces allowed"})
+    assert (first.status_code, second.status_code) == (201, 200)
+    assert first.json()["upload_id"] == second.json()["upload_id"]
+    assert bad.status_code == 422
+
+
+async def test_idempotency_key_prevents_second_copy(live_server, app, random_file):
+    """The application crashed after upload() returned but before it stored the
+    result; uploading again with the same key returns the existing upload."""
+    source = random_file("key.bin", 200 * KiB)
+    base = f"{live_server.url}/uploads"
+    async with AsyncUploader(base) as uploader:  # no state_dir: no journal at all
+        first = await uploader.upload(source, idempotency_key="survey-42/key.bin")
+        again = await uploader.upload(source, idempotency_key="survey-42/key.bin")
+        other = await uploader.upload(source, idempotency_key="survey-43/key.bin")
+    assert not first.resumed
+    assert again.resumed and again.upload_id == first.upload_id
+    assert other.upload_id != first.upload_id
+    assert len(app.state.completed) == 2

@@ -28,5 +28,6 @@ Thumbs.db
 
 # xferkit runtime data
 xferkit-data/
+loadtest-data/
 *.xferkit-part
 *.xferkit-state
