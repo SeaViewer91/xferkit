@@ -66,7 +66,7 @@ path = "src/xferkit/_version.py"
 packages = ["src/xferkit"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/xferkit", "tests", "docs", "examples", "README.md", "LICENSE", "CHANGELOG.md"]
+include = ["src/xferkit", "tests", "docs", "examples", "README.md", "README.ko.md", "LICENSE", "CHANGELOG.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

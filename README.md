@@ -1,5 +1,7 @@
 # xferkit
 
+**English** | [한국어](README.ko.md)
+
 **Chunked, resumable large-file upload/download SDK for Python servers — FastAPI-ready.**
 
 xferkit moves very large files (tens or hundreds of GB) over plain HTTP:
