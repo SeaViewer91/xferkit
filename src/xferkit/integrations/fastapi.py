@@ -62,6 +62,8 @@ __all__ = [
     "CORS_ALLOW_HEADERS",
     "CORS_EXPOSE_HEADERS",
     "AccessContext",
+    "BatchCreateRequest",
+    "BatchStatusRequest",
     "Caller",
     "CreateUploadRequest",
     "add_cors",
@@ -120,6 +122,45 @@ class CreateUploadRequest(BaseModel):
             "returns the existing upload (200) instead of creating another one (201)."
         ),
     )
+    auto_complete: bool = Field(
+        default=False,
+        description=(
+            "Complete the upload as soon as its last part arrives (the part response then "
+            "contains 'completed'), saving the separate complete request. For small files."
+        ),
+    )
+
+    def manager_kwargs(self) -> dict[str, Any]:
+        return {
+            "filename": self.filename,
+            "size": self.size,
+            "chunk_size": self.chunk_size,
+            "checksum": self.checksum,
+            "metadata": self.metadata,
+            "client_token": self.client_token,
+            "auto_complete": self.auto_complete,
+        }
+
+
+class BatchCreateRequest(BaseModel):
+    """Body of ``POST {prefix}/batch``."""
+
+    files: list[CreateUploadRequest] = Field(min_length=1, max_length=1000)
+
+
+class BatchStatusRequest(BaseModel):
+    """Body of ``POST {prefix}/batch/status``."""
+
+    upload_ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+def _batch_item(outcome: Any) -> dict[str, Any]:
+    if isinstance(outcome, XferkitError):
+        return {**outcome.to_dict(), "status": outcome.status_code}
+    if isinstance(outcome, tuple):
+        state, created = outcome
+        return {**state, "created": created}
+    return outcome
 
 
 @dataclass(frozen=True)
@@ -238,6 +279,7 @@ def create_upload_router(
         upload_id: str | None = None,
         create: CreateUploadRequest | None = None,
         check_owner: bool = True,
+        run_authorize: bool = True,
     ) -> Caller:
         caller = await resolve_caller(request)
         request.state.xferkit_caller = caller
@@ -252,7 +294,7 @@ def create_upload_router(
             and not _grant_names_upload(caller.grant, upload_id)
         ):
             await run_in_threadpool(manager.ensure_access, upload_id, caller.owner)
-        if authorize is not None:
+        if authorize is not None and run_authorize:
             context = AccessContext(caller, action, upload_id, create)
             if await _maybe_await(authorize(request, context)) is False:
                 raise Forbidden(f"not allowed to {action.replace('_', ' ')}")
@@ -268,20 +310,54 @@ def create_upload_router(
                     "file is larger than this grant allows", details={"max_size": limit}
                 )
             state, created = await run_in_threadpool(
-                lambda: manager.open_upload(
-                    body.filename,
-                    body.size,
-                    chunk_size=body.chunk_size,
-                    checksum=body.checksum,
-                    metadata=body.metadata,
-                    client_token=body.client_token,
-                    owner=caller.owner,
-                )
+                lambda: manager.open_upload(**body.manager_kwargs(), owner=caller.owner)
             )
         except XferkitError as exc:
             return error_response(exc)
         location = str(request.url_for(f"{_name(prefix)}_status", upload_id=state["upload_id"]))
         return _json(state, 201 if created else 200, {"Location": location})
+
+    @router.post("/batch", summary="Create (or find, by client_token) many upload sessions")
+    async def create_batch(body: BatchCreateRequest, request: Request) -> Response:
+        try:
+            caller = await guard(request, "create", run_authorize=False)
+        except XferkitError as exc:
+            return error_response(exc)
+        limit = caller.grant.max_size if caller.grant is not None else None
+        results: list[Any] = [None] * len(body.files)
+        accepted: list[tuple[int, dict[str, Any]]] = []
+        for i, item in enumerate(body.files):
+            if limit is not None and item.size > limit:
+                results[i] = PayloadTooLarge(
+                    "file is larger than this grant allows", details={"max_size": limit}
+                )
+                continue
+            if authorize is not None:
+                context = AccessContext(caller, "create", None, item)
+                if await _maybe_await(authorize(request, context)) is False:
+                    results[i] = Forbidden("not allowed to create")
+                    continue
+            accepted.append((i, item.manager_kwargs()))
+        try:
+            outcomes = await run_in_threadpool(
+                lambda: manager.open_uploads([kw for _, kw in accepted], owner=caller.owner)
+            )
+        except XferkitError as exc:
+            return error_response(exc)
+        for (i, _), outcome in zip(accepted, outcomes, strict=True):
+            results[i] = outcome
+        return _json({"uploads": [_batch_item(r) for r in results]})
+
+    @router.post("/batch/status", summary="Status of many uploads")
+    async def batch_status(body: BatchStatusRequest, request: Request) -> Response:
+        try:
+            caller = await guard(request, "status")
+            outcomes = await run_in_threadpool(
+                lambda: manager.describe_many(body.upload_ids, caller=caller.owner)
+            )
+        except XferkitError as exc:
+            return error_response(exc)
+        return _json({"uploads": [_batch_item(r) for r in outcomes]})
 
     @router.get("/{upload_id}", name=f"{_name(prefix)}_status", summary="Upload status")
     async def get_status(upload_id: str, request: Request) -> Response:
@@ -330,7 +406,19 @@ def create_upload_router(
         except BaseException:  # client disconnect, cancellation, ...
             await run_in_threadpool(sink.abort)
             raise
-        return _json(record.to_dict())
+        body = record.to_dict()
+        if session.auto_complete:
+            try:
+                outcome = await run_in_threadpool(manager.complete_if_ready, upload_id)
+            except XferkitError as exc:  # the part is stored; report why completion failed
+                body["completion_error"] = exc.to_dict()["error"]
+            else:
+                if outcome is not None:
+                    completed, created = outcome
+                    if created and on_complete is not None:
+                        await _maybe_await(on_complete(completed, request))
+                    body["completed"] = completed.to_dict()
+        return _json(body)
 
     @router.post("/{upload_id}/complete", summary="Assemble and verify the upload")
     async def complete_upload(upload_id: str, request: Request) -> Response:
@@ -360,8 +448,14 @@ def create_upload_router(
             try:
                 await guard(request, "download", upload_id=upload_id)
                 completed = await run_in_threadpool(manager.get_completed, upload_id)
+                url = await run_in_threadpool(manager.storage.download_url, completed)
             except XferkitError as exc:
                 return error_response(exc)
+            if url is not None:  # e.g. a presigned object-storage URL
+                return Response(
+                    status_code=307,
+                    headers={**_BASE_HEADERS, "Location": url, "Cache-Control": "no-store"},
+                )
             return range_file_response(request, completed.path, filename=completed.filename)
 
     return router

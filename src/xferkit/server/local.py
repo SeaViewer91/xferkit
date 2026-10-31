@@ -529,7 +529,11 @@ class LocalStorage(StorageBackend):
         if not directory.is_dir():
             raise UploadNotFound(f"upload {session.upload_id!r} not found")
         lock = directory / self.COMPLETING_LOCK
-        if not _try_lock(lock, self.completion_lock_timeout):
+        try:
+            locked = _try_lock(lock, self.completion_lock_timeout)
+        except FileNotFoundError:  # completed (or aborted) by someone else just now
+            raise UploadNotFound(f"upload {session.upload_id!r} not found") from None
+        if not locked:
             raise UploadConflict("upload is already being completed")
         try:
             completed = self._finalize_locked(session, directory, verify_checksum)

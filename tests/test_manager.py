@@ -200,7 +200,9 @@ def test_limits_and_chunk_size_selection(tmp_path):
     with pytest.raises(InvalidRequest):
         manager.create_upload("tiny", 10 * MiB, chunk_size=1 * KiB)  # too many parts
     with pytest.raises(InvalidRequest):
-        manager.create_upload("x", 10, chunk_size=10)  # below min_chunk_size
+        manager.create_upload("x", 100, chunk_size=10)  # below min_chunk_size
+    # ... unless the whole file fits into that one part
+    assert manager.create_upload("x", 10, chunk_size=10).total_parts == 1
     with pytest.raises(InvalidRequest):
         manager.create_upload("", 10)
     with pytest.raises(InvalidRequest):

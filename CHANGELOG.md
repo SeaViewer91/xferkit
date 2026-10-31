@@ -30,6 +30,32 @@ First version.
   `mount_browser_client`): parallel resumable verified uploads, ranged
   downloads to Blob or disk, grants, abort/resume, idempotency keys shared
   with Python; `add_cors` helper.
+- Folder and batch uploads: `upload_many()` / `upload_folder()` in Python,
+  `uploadFiles()` / `filesFromDataTransfer()` in the browser, `xferkit upload
+  <folder>` in the CLI. Folder structure kept as `metadata.relative_path`,
+  include/exclude patterns, per-file results, combined progress. Re-running a
+  batch resumes unfinished files and skips finished ones without a journal
+  (keys derived from path, size and mtime; the same in Python and the
+  browser).
+- Batch endpoints `POST /uploads/batch` and `POST /uploads/batch/status`, and
+  `auto_complete` sessions that complete with their last part: a small file
+  now costs one request instead of three (1.5× faster for 2000 × 64 KiB on
+  loopback, see `benchmarks/README.md`).
+- S3-compatible storage backend `xferkit.server.s3.S3Storage` (`pip install
+  "xferkit[s3]"`): uploads become S3 multipart uploads, parts are verified
+  before they are sent, state lives in the bucket (multi-server safe),
+  downloads redirect to presigned URLs. Backends can declare part-size and
+  part-count limits (`min_part_size`, `max_parts`) and a `download_url()`.
+- `CompletedUpload.location` (e.g. `s3://bucket/key`).
+- A requested `chunk_size` below the minimum is accepted when the whole file
+  fits into one part.
+
+### Fixed by tests
+
+- Two requests completing the same upload at the same moment could make the
+  slower one fail with a `500` (its session directory vanished while it took
+  the completion lock). It now returns the winner's completion record. Found
+  by the batch tests with auto-completed two-part files.
 
 ### Fixed by the load test
 

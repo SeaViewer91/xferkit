@@ -75,7 +75,7 @@ export interface UploadOptions extends ConnectionOptions {
   onProgress?: ProgressCallback;
 }
 
-const PART_RETRY_STATUSES = [409, 422]; // part still locked server-side / corrupted in transit
+export const PART_RETRY_STATUSES = [409, 422]; // part still locked server-side / corrupted in transit
 
 interface Journal {
   clientToken: string;
@@ -104,7 +104,7 @@ function resolveStore(resume: UploadOptions["resume"]): ResumeStore | null {
   return resume;
 }
 
-function join(base: string, ...parts: string[]): string {
+export function join(base: string, ...parts: string[]): string {
   return [base.replace(/\/+$/, ""), ...parts.map(encodeURIComponent)].join("/");
 }
 
@@ -194,10 +194,54 @@ export async function upload(file: Blob, options: UploadOptions): Promise<Upload
     resumed = response.status === 200;
     saveJournal({ clientToken, uploadId: status.upload_id });
   }
+
+  let done = 0;
+  const result = await transfer(file, filename, status, resumed, options, (delta) => {
+    done += delta;
+    options.onProgress?.(progressOf(done, size));
+  });
+  store?.remove(key);
+  return result;
+}
+
+/** Concurrency limit shared by several transfers. */
+export class Limiter {
+  private active = 0;
+  private readonly waiting: (() => void)[] = [];
+
+  constructor(private readonly limit: number) {}
+
+  async run<T>(task: () => Promise<T>): Promise<T> {
+    if (this.active >= this.limit) await new Promise<void>((resolve) => this.waiting.push(resolve));
+    else this.active++;
+    try {
+      return await task();
+    } finally {
+      const next = this.waiting.shift();
+      if (next) next();
+      else this.active--;
+    }
+  }
+}
+
+/**
+ * Send the parts the server is missing, complete and verify. `status` is the
+ * session's server-side state (or its completion record). @internal
+ */
+export async function transfer(
+  file: Blob,
+  filename: string,
+  status: UploadState,
+  resumed: boolean,
+  options: UploadOptions,
+  onBytes: (delta: number) => void,
+  limiter?: Limiter,
+): Promise<UploadResult> {
+  const baseUrl = options.baseUrl.replace(/\/+$/, "");
+  const size = file.size;
   if (status.size !== size) {
     throw new XferkitError(`upload ${status.upload_id} expects ${status.size} bytes, the file has ${size}`, "invalid_request");
   }
-
   const uploadId = status.upload_id;
   const chunkSize = status.chunk_size;
   const count = size === 0 ? 0 : Math.ceil(size / chunkSize);
@@ -205,49 +249,53 @@ export async function upload(file: Blob, options: UploadOptions): Promise<Upload
   const digests = new Map<number, Uint8Array>();
   const received = new Set<number>(status.state === "completed" ? Array.from({ length: count }, (_, i) => i) : status.received_parts ?? []);
 
-  let done = 0;
-  for (const i of received) done += partLength(i);
-  options.onProgress?.(progressOf(done, size));
+  let initial = 0;
+  for (const i of received) initial += partLength(i);
+  onBytes(initial);
 
-  const sendParts = async (indices: number[]) => {
-    await runPool(indices, Math.max(1, options.concurrency ?? 4), async (index) => {
-      throwIfAborted(options.signal);
-      const start = index * chunkSize;
-      const slice = file.slice(start, start + partLength(index));
-      const digest = await sha256(await slice.arrayBuffer());
-      await fetchJson(
-        options,
-        join(baseUrl, uploadId, "parts", String(index)),
-        {
-          method: "PUT",
-          headers: buildHeaders(options, {
-            "Content-Type": "application/octet-stream",
-            [CHECKSUM_HEADER]: `sha256=${toHex(digest)}`,
-          }),
-          // A Blob body is streamed from the file by the browser; an ArrayBuffer
-          // body is copied between processes and is ~8x slower in Chromium.
-          body: slice,
-        },
-        PART_RETRY_STATUSES,
-      );
-      digests.set(index, digest);
-      done += slice.size;
-      options.onProgress?.(progressOf(done, size));
-    });
+  // An auto_complete session answers its last part with the completion record.
+  let completed = null as UploadState | null;
+  const sendOne = async (index: number) => {
+    throwIfAborted(options.signal);
+    const start = index * chunkSize;
+    const slice = file.slice(start, start + partLength(index));
+    const digest = await sha256(await slice.arrayBuffer());
+    const { data } = await fetchJson<{ completed?: UploadState }>(
+      options,
+      join(baseUrl, uploadId, "parts", String(index)),
+      {
+        method: "PUT",
+        headers: buildHeaders(options, {
+          "Content-Type": "application/octet-stream",
+          [CHECKSUM_HEADER]: `sha256=${toHex(digest)}`,
+        }),
+        // A Blob body is streamed from the file by the browser; an ArrayBuffer
+        // body is copied between processes and is ~8x slower in Chromium.
+        body: slice,
+      },
+      PART_RETRY_STATUSES,
+    );
+    digests.set(index, digest);
+    if (data && typeof data.completed === "object") completed = data.completed;
+    onBytes(slice.size);
   };
+  const sendParts = (indices: number[]) =>
+    runPool(indices, Math.max(1, options.concurrency ?? 4), (index) => (limiter ? limiter.run(() => sendOne(index)) : sendOne(index)));
 
   let response: UploadState;
   if (status.state === "completed") {
     response = status; // finished earlier; we only verify below
   } else {
     await sendParts(Array.from({ length: count }, (_, i) => i).filter((i) => !received.has(i)));
-    response = await completeWithRecovery(baseUrl, uploadId, options, async (missing) => {
-      for (const i of missing) {
-        done -= partLength(i); // counted before, will be counted again when re-sent
-        digests.delete(i);
-      }
-      await sendParts(missing);
-    });
+    response =
+      completed ??
+      (await completeWithRecovery(baseUrl, uploadId, options, async (missing) => {
+        for (const i of missing) {
+          onBytes(-partLength(i)); // counted before, will be counted again when re-sent
+          digests.delete(i);
+        }
+        await sendParts(missing);
+      }));
   }
 
   // End-to-end check: hash of the part hashes, computed independently on both sides.
@@ -264,7 +312,6 @@ export async function upload(file: Blob, options: UploadOptions): Promise<Upload
       remote: response.composite_checksum,
     });
   }
-  store?.remove(key);
   return {
     uploadId,
     filename: response.filename ?? filename,

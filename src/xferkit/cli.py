@@ -33,8 +33,11 @@ class _ProgressPrinter:
         self._last = now
         elapsed = max(now - self.started, 1e-6)
         speed = (progress.bytes_done - self._first_done) / elapsed / MiB
+        files = ""
+        if hasattr(progress, "files_total"):
+            files = f"{progress.files_done + progress.files_failed}/{progress.files_total} files  "
         self.stream.write(
-            f"\r{self.label}: {progress.fraction * 100:6.2f}%  "
+            f"\r{self.label}: {progress.fraction * 100:6.2f}%  {files}"
             f"{progress.bytes_done / MiB:,.1f}/{progress.bytes_total / MiB:,.1f} MiB  "
             f"{speed:,.1f} MiB/s "
         )
@@ -72,8 +75,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"xferkit {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    up = sub.add_parser("upload", help="upload a file to an xferkit server")
-    up.add_argument("file", type=Path)
+    up = sub.add_parser("upload", help="upload a file or a folder to an xferkit server")
+    up.add_argument("file", type=Path, help="file, or folder to upload with its sub-folders")
     up.add_argument("url", help="upload endpoint, e.g. https://host/uploads")
     up.add_argument("--filename", help="name to store on the server")
     up.add_argument("--chunk-size", type=parse_size, help="part size, e.g. 8M (server default)")
@@ -86,6 +89,18 @@ def _build_parser() -> argparse.ArgumentParser:
         "--idempotency-key", help="re-running with the same key never uploads a second copy"
     )
     up.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
+    folder = up.add_argument_group("folders")
+    folder.add_argument("--include", action="append", metavar="GLOB", help="e.g. '*.jpg'")
+    folder.add_argument("--exclude", action="append", metavar="GLOB")
+    folder.add_argument("--hidden", action="store_true", help="include dot files and folders")
+    folder.add_argument(
+        "--files", type=int, metavar="N", help="files in progress at once (default max(c, 8))"
+    )
+    folder.add_argument(
+        "--key-prefix",
+        help="build re-run detection keys from this prefix and relative paths "
+        "instead of absolute paths (same folder elsewhere = same uploads)",
+    )
     up.add_argument("--checksum", action="store_true", help="also verify a whole-file sha256")
     up.add_argument("-q", "--quiet", action="store_true")
 
@@ -103,10 +118,42 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _upload_folder(args: argparse.Namespace, printer, upload_folder) -> int:
+    for option in ("filename", "upload_id", "idempotency_key"):
+        if getattr(args, option):
+            raise SystemExit(f"--{option.replace('_', '-')} cannot be used with a folder")
+    result = upload_folder(
+        args.url,
+        args.file,
+        include=args.include,
+        exclude=args.exclude,
+        include_hidden=args.hidden,
+        key_prefix=args.key_prefix,
+        file_concurrency=args.files,
+        metadata=_metadata(args.meta),
+        progress=printer,
+        headers=_headers(args.header),
+        grant=args.grant,
+        chunk_size=args.chunk_size,
+        concurrency=args.concurrency,
+        send_checksum=args.checksum,
+    )
+    if printer:
+        printer.finish()
+    for failure in result.failed:
+        print(f"failed: {failure.path}: {failure.error}", file=sys.stderr)
+    skipped = sum(r.resumed for r in result.uploaded)
+    print(
+        f"{len(result.uploaded)} uploaded ({skipped} already on the server or resumed), "
+        f"{len(result.failed)} failed"
+    )
+    return 0 if result.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
-        from .client import download_file, upload_file
+        from .client import download_file, upload_file, upload_folder
     except ImportError:  # pragma: no cover
         print('the client extra is required: pip install "xferkit[client]"', file=sys.stderr)
         return 2
@@ -114,6 +161,8 @@ def main(argv: list[str] | None = None) -> int:
 
     printer = None if args.quiet else _ProgressPrinter(args.command)
     try:
+        if args.command == "upload" and args.file.is_dir():
+            return _upload_folder(args, printer, upload_folder)
         if args.command == "upload":
             result = upload_file(
                 args.url,

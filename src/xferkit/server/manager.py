@@ -28,7 +28,9 @@ from ..errors import (
     TooManyUploads,
     UploadConflict,
     UploadExpired,
+    UploadIncomplete,
     UploadNotFound,
+    XferkitError,
 )
 from ..models import CompletedUpload, PartRecord, UploadSession, UploadStatus
 from ..protocol import (
@@ -103,6 +105,7 @@ class UploadManager:
             :meth:`cleanup_expired`.
         remove_files_on_expiry: Also delete the assembled file when its record
             expires. Leave off if ``on_complete`` moves files elsewhere.
+        max_batch_size: Most files accepted by one batch request.
         id_factory: Generates upload ids (must match ``[A-Za-z0-9_-]{8,128}``).
         clock: Time source, injectable for tests.
     """
@@ -126,6 +129,7 @@ class UploadManager:
         max_pending_bytes_per_owner: int | None = None,
         completed_ttl: float | None = 7 * 24 * 3600,
         remove_files_on_expiry: bool = False,
+        max_batch_size: int = 1000,
         id_factory: Callable[[], str] = _default_id,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -136,6 +140,14 @@ class UploadManager:
         self.storage: StorageBackend = (
             storage if isinstance(storage, StorageBackend) else LocalStorage(storage)
         )
+        # Object stores have their own limits (S3: parts >= 5 MiB, <= 10 000 parts).
+        min_chunk_size = max(min_chunk_size, self.storage.min_part_size)
+        if self.storage.max_parts is not None:
+            max_parts = min(max_parts, self.storage.max_parts)
+        if default_chunk_size < min_chunk_size:
+            raise ValueError(
+                f"default_chunk_size must be at least {min_chunk_size} for this storage backend"
+            )
         self.max_upload_size = max_upload_size
         self.default_chunk_size = default_chunk_size
         self.min_chunk_size = min_chunk_size
@@ -151,6 +163,7 @@ class UploadManager:
         self.max_pending_bytes_per_owner = max_pending_bytes_per_owner
         self.completed_ttl = completed_ttl
         self.remove_files_on_expiry = remove_files_on_expiry
+        self.max_batch_size = max_batch_size
         self.garbage_age = 3600.0  # seconds before crash leftovers are collected
         self._id_factory = id_factory
         self._clock = clock
@@ -166,6 +179,7 @@ class UploadManager:
         checksum: str | None = None,
         metadata: dict[str, str] | None = None,
         owner: str | None = None,
+        auto_complete: bool = False,
     ) -> UploadSession:
         """Open a new upload session (see :meth:`open_upload` for the idempotent
         variant used by the HTTP integration).
@@ -179,10 +193,13 @@ class UploadManager:
                 completion when ``verify_checksum`` is enabled.
             metadata: Free-form string key/value pairs kept with the upload.
             owner: Principal the upload belongs to (``None`` = anonymous).
+            auto_complete: Complete the upload as soon as its last part has
+                arrived (see :meth:`put_part_and_complete`). Meant for small
+                files, where it saves the separate ``complete`` request.
         """
         session = self._new_session(
             filename, size, chunk_size=chunk_size, checksum=checksum, metadata=metadata,
-            owner=owner,
+            owner=owner, auto_complete=auto_complete,
         )  # fmt: skip
         self.storage.create(session)
         logger.debug("created upload %s (%s, %d bytes)", session.upload_id, filename, size)
@@ -197,6 +214,7 @@ class UploadManager:
         checksum: str | None = None,
         metadata: dict[str, str] | None = None,
         owner: str | None = None,
+        auto_complete: bool = False,
     ) -> UploadSession:
         """Validate and admit the request, and build (but not store) a session.
 
@@ -231,6 +249,7 @@ class UploadManager:
             checksum=checksum,
             metadata=metadata,
             owner=owner,
+            auto_complete=auto_complete,
         )
 
     def _admit(self, request: CreateRequest) -> None:
@@ -279,6 +298,7 @@ class UploadManager:
         metadata: dict[str, str] | None = None,
         client_token: str | None = None,
         owner: str | None = None,
+        auto_complete: bool = False,
     ) -> tuple[dict[str, Any], bool]:
         """Create a session, idempotently when the client sends a token.
 
@@ -314,7 +334,7 @@ class UploadManager:
 
         session = self._new_session(
             filename, size, chunk_size=chunk_size, checksum=checksum, metadata=metadata,
-            owner=owner,
+            owner=owner, auto_complete=auto_complete,
         )  # fmt: skip
         if token is not None:
             # Bind the token *before* creating the session: if the server dies in
@@ -340,6 +360,62 @@ class UploadManager:
                 "client_token was already used for a different file",
                 details={"upload_id": state.get("upload_id")},
             )
+
+    def open_uploads(
+        self, requests: list[dict[str, Any]], *, owner: str | None = None
+    ) -> list[tuple[dict[str, Any], bool] | XferkitError]:
+        """Create (or find, by client token) many uploads in one call.
+
+        Each request is a dict of :meth:`open_upload` keyword arguments
+        (``filename``, ``size``, ``chunk_size``, ``checksum``, ``metadata``,
+        ``client_token``, ``auto_complete``). Items fail independently: the
+        result list holds ``(state, created)`` or the error for each item.
+        """
+        if len(requests) > self.max_batch_size:
+            raise InvalidRequest(f"at most {self.max_batch_size} files per batch")
+        results: list[tuple[dict[str, Any], bool] | XferkitError] = []
+        for request in requests:
+            try:
+                results.append(self.open_upload(**request, owner=owner))
+            except XferkitError as exc:
+                results.append(exc)
+        return results
+
+    def describe_many(
+        self, upload_ids: list[str], *, caller: str | None = None
+    ) -> list[dict[str, Any] | XferkitError]:
+        """:meth:`describe` for many uploads, applying :meth:`ensure_access`."""
+        if len(upload_ids) > self.max_batch_size:
+            raise InvalidRequest(f"at most {self.max_batch_size} uploads per batch")
+        results: list[dict[str, Any] | XferkitError] = []
+        for upload_id in upload_ids:
+            try:
+                self.ensure_access(upload_id, caller)
+                results.append(self.describe(upload_id))
+            except XferkitError as exc:
+                results.append(exc)
+        return results
+
+    def complete_if_ready(self, upload_id: str) -> tuple[CompletedUpload, bool] | None:
+        """Complete an ``auto_complete`` upload once all its parts are present.
+
+        Returns ``None`` while parts are missing (or if the session is not
+        marked ``auto_complete``), else the result of :meth:`complete_upload`.
+        Safe to call concurrently: only one caller sees ``created=True``.
+        """
+        try:
+            session = self.get_session(upload_id)
+        except UploadNotFound:
+            existing = self.storage.get_completed(upload_id)
+            return (existing, False) if existing is not None else None
+        if not session.auto_complete:
+            return None
+        if len(self.storage.received_parts(session)) < session.total_parts:
+            return None
+        try:
+            return self.complete_upload(upload_id)
+        except (UploadConflict, UploadIncomplete):
+            return None  # another request is completing it, or a part is being rewritten
 
     # ------------------------------------------------------------------ query
 
@@ -467,7 +543,7 @@ class UploadManager:
             raise
         try:
             completed = self.storage.finalize(session, verify_checksum=self.verify_checksum)
-        except UploadConflict:
+        except (UploadConflict, UploadNotFound):  # a concurrent call won the race
             existing = self.storage.get_completed(upload_id)
             if existing is not None:
                 return existing, False
@@ -567,7 +643,9 @@ class UploadManager:
             return chunk
         if not isinstance(requested, int) or isinstance(requested, bool):
             raise InvalidRequest("chunk_size must be an integer")
-        if not self.min_chunk_size <= requested <= self.max_chunk_size:
+        # A file that fits in one part is fine with any chunk size >= its size.
+        too_small = requested < self.min_chunk_size and requested < size
+        if too_small or requested > self.max_chunk_size or requested < 1:
             raise InvalidRequest(
                 f"chunk_size must be between {self.min_chunk_size} and {self.max_chunk_size}",
                 details={

@@ -20,6 +20,7 @@ keywords = [
     "range-requests",
     "fastapi",
     "large-files",
+    "s3",
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -42,9 +43,12 @@ dependencies = []
 [project.optional-dependencies]
 fastapi = ["fastapi>=0.110"]
 client = ["httpx>=0.27"]
-all = ["xferkit[fastapi,client]"]
+# S3-compatible object storage backend (xferkit.server.s3.S3Storage)
+s3 = ["boto3>=1.35"]
+all = ["xferkit[fastapi,client,s3]"]
 dev = [
     "xferkit[all]",
+    "moto[server]>=5",
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "uvicorn>=0.29",

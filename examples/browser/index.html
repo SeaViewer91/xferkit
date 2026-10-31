@@ -31,15 +31,16 @@
 <body>
 <main>
   <h1>xferkit browser demo</h1>
-  <p class="lead">Files are uploaded in parallel parts, verified with SHA-256, and resume after a reload or a dropped connection: just drop the same file again.</p>
+  <p class="lead">Files are uploaded in parallel parts, verified with SHA-256, and resume after a reload or a dropped connection: just drop the same file again. Folders keep their structure, and files already on the server are skipped.</p>
   <label id="drop">
     <input id="pick" type="file" multiple>
-    <strong>Drop files here</strong> or click to choose
+    <strong>Drop files or folders here</strong> or click to choose files
   </label>
+  <p class="meta"><label><input id="pick-folder" type="file" webkitdirectory hidden><button type="button" id="folder-button">Choose a folder…</button></label></p>
   <ul id="list"></ul>
 </main>
 <script type="module">
-  import { upload } from "/xferkit.mjs";
+  import { upload, uploadFiles, filesFromDataTransfer } from "/xferkit.mjs";
 
   const list = document.getElementById("list");
   const drop = document.getElementById("drop");
@@ -77,10 +78,66 @@
     }
   }
 
+  // A folder (or several dropped items) goes as one batch with combined progress.
+  async function sendBatch(label, entries) {
+    const li = document.createElement("li");
+    li.innerHTML = `<div class="row"><span class="name"></span><span class="meta">starting…</span></div>
+                    <progress max="1" value="0"></progress>
+                    <div class="row"><span class="meta status"></span><button>Cancel</button></div>`;
+    li.querySelector(".name").textContent = label;
+    list.prepend(li);
+    const meta = li.querySelector(".meta"), bar = li.querySelector("progress");
+    const status = li.querySelector(".status"), cancel = li.querySelector("button");
+    const controller = new AbortController();
+    cancel.onclick = () => controller.abort();
+    const started = performance.now();
+    try {
+      const { grant, baseUrl } = await (await fetch("/demo/grant")).json();
+      const result = await uploadFiles(entries, {
+        baseUrl, grant, signal: controller.signal,
+        onProgress: (p) => {
+          bar.value = p.fraction;
+          const secs = (performance.now() - started) / 1000;
+          meta.textContent = `${p.filesDone + p.filesFailed} / ${p.filesTotal} files · ${fmt(p.bytesDone)} / ${fmt(p.bytesTotal)} · ${fmt(p.bytesDone / Math.max(secs, 0.001))}/s`;
+        },
+      });
+      const skipped = result.uploaded.filter((u) => u.resumed).length;
+      status.innerHTML = `<span class="ok">✓ ${result.uploaded.length} verified</span>` +
+        (skipped ? ` (${skipped} already there or resumed)` : "") +
+        (result.failed.length ? ` · <span class="err">${result.failed.length} failed</span>` : "");
+      for (const f of result.failed) {
+        const line = document.createElement("div");
+        line.className = "meta err";
+        line.textContent = `${f.relativePath}: ${f.error.message}`;
+        li.append(line);
+      }
+      cancel.remove();
+    } catch (error) {
+      const resumable = error.name === "AbortError";
+      status.innerHTML = `<span class="err">${resumable ? "cancelled — choose the folder again to resume" : error.message}</span>`;
+      cancel.remove();
+    }
+  }
+
   document.getElementById("pick").onchange = (e) => [...e.target.files].forEach(send);
+  const folderInput = document.getElementById("pick-folder");
+  document.getElementById("folder-button").onclick = () => folderInput.click();
+  folderInput.onchange = (e) => {
+    const files = [...e.target.files];
+    if (files.length) sendBatch(`${files[0].webkitRelativePath.split("/")[0]}/`, files);
+    e.target.value = "";
+  };
   drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
   drop.ondragleave = () => drop.classList.remove("over");
-  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); [...e.dataTransfer.files].forEach(send); };
+  drop.ondrop = async (e) => {
+    e.preventDefault();
+    drop.classList.remove("over");
+    const hasFolder = [...e.dataTransfer.items].some((item) => item.webkitGetAsEntry?.()?.isDirectory);
+    if (!hasFolder) return [...e.dataTransfer.files].forEach(send);
+    const entries = await filesFromDataTransfer(e.dataTransfer);   // reads the entries synchronously
+    const folders = [...new Set(entries.map((x) => x.folder).filter(Boolean))];
+    sendBatch(folders.map((f) => `${f}/`).join(", "), entries);
+  };
 </script>
 </body>
 </html>

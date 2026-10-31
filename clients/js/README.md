@@ -1,7 +1,7 @@
 # xferkit — browser client
 
 Parallel, resumable, verified uploads and downloads from the browser to an
-[xferkit](https://github.com/SeaViewer91/xferkit) server. No dependencies, ~18 KB.
+[xferkit](https://github.com/SeaViewer91/xferkit) server. No dependencies, ~28 KB.
 
 - Uploads files in parallel parts; every part is SHA-256 checked by the server
   and the whole file is verified end to end with a composite checksum.
@@ -9,6 +9,8 @@ Parallel, resumable, verified uploads and downloads from the browser to an
   call `upload()` again with the same file.
 - `idempotencyKey` guarantees one server-side copy per key — the same key means
   the same upload in the Python client too.
+- Uploads whole folders and thousands of files with per-file results; small
+  files cost one request each, and running again skips what is already there.
 - Downloads with parallel range requests into a `Blob` or straight to disk
   (File System Access API).
 - Signed grants and custom headers for authentication, `credentials` for cookies.
@@ -51,6 +53,37 @@ console.log(result.uploadId, result.resumed, result.compositeChecksum);
 Progress is reported per part (8 MiB by default). Resume state lives in
 `localStorage` under `xferkit:upload:*` and is removed after success; pass
 `resume: false` or your own `{ get, set, remove }` store to change that.
+
+## Folders and many files
+
+```js
+import { uploadFiles, filesFromDataTransfer } from "/xferkit.mjs";
+
+// <input type="file" webkitdirectory> (or multiple)
+const result = await uploadFiles(folderInput.files, {
+  baseUrl, grant,
+  fileConcurrency: 6,               // files at once; parts in flight stay <= concurrency
+  onProgress: (p) => (label.textContent = `${p.filesDone}/${p.filesTotal} · ${Math.round(p.fraction * 100)}%`),
+  onFile: (f) => console.log(f.relativePath, "error" in f ? f.error : f.uploadId),
+});
+result.failed.forEach((f) => console.warn(f.relativePath, f.error));
+
+// Drag and drop, folders included (call it before any await in the handler):
+dropZone.ondrop = async (e) => {
+  e.preventDefault();
+  await uploadFiles(await filesFromDataTransfer(e.dataTransfer), { baseUrl, grant });
+};
+```
+
+Each file keeps its name and sends its path inside the folder as
+`metadata.relative_path`. Files fail independently. Sessions are created 100 at
+a time and files up to 64 MiB are completed by the server with their last part.
+With `dedupe` (default) every file's idempotency key comes from the folder
+name, relative path, size and `lastModified`: picking the same folder again
+resumes unfinished files and only verifies finished ones. The Python client
+derives the same keys with `upload_folder(root, key_prefix="<folder name>/")`.
+Hidden files (`.DS_Store`, ...) inside folders are skipped unless
+`skipHidden: false`.
 
 ## Download
 

@@ -4,9 +4,13 @@ Run:
     pip install -e ".[dev]"
     uvicorn examples.server_app:app --port 8000
 
-Then open http://127.0.0.1:8000 and drop some files on the page, or use the CLI:
+Then open http://127.0.0.1:8000 and drop some files or folders on the page, or
+use the CLI:
     xferkit upload some_big_file.bin http://127.0.0.1:8000/uploads
     xferkit download http://127.0.0.1:8000/uploads/<upload_id>/content ./copy.bin
+
+To keep uploads in an S3-compatible bucket instead of on disk:
+    XFERKIT_S3_BUCKET=my-bucket [XFERKIT_S3_ENDPOINT=http://127.0.0.1:9000] uvicorn ...
 
 The /demo/* endpoints stand in for your application: in a real service they sit
 behind your login and issue grants only to authenticated users.
@@ -53,8 +57,20 @@ def _grant_secret() -> str:
 
 signer = GrantSigner(_grant_secret())
 
+
+def _storage():
+    """Local disk by default; an S3-compatible bucket when XFERKIT_S3_BUCKET is set
+    (credentials from the usual AWS environment variables / config files)."""
+    bucket = os.environ.get("XFERKIT_S3_BUCKET")
+    if bucket:
+        from xferkit.server.s3 import S3Storage  # pip install "xferkit[s3]"
+
+        return S3Storage(bucket, endpoint_url=os.environ.get("XFERKIT_S3_ENDPOINT"))
+    return LocalStorage(STORAGE / "store", min_free_bytes=2 * 1024**3)  # keep 2 GiB free
+
+
 manager = UploadManager(
-    LocalStorage(STORAGE / "store", min_free_bytes=2 * 1024**3),  # keep 2 GiB free
+    _storage(),
     ttl=24 * 3600,  # unfinished uploads expire after a day
     max_pending_per_owner=50,
     completed_ttl=7 * 24 * 3600,  # completion records kept for a week

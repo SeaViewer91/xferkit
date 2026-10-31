@@ -9,17 +9,19 @@ xferkit은 수십~수백 GB 단위의 대용량 파일을 일반 HTTP로 주고�
 - **병렬·이어받기 업로드.** 파일을 여러 파트로 나눠 동시에 보냅니다. 업로드가 끊기면 클라이언트 프로세스를 다시 시작하거나 페이지를 새로고침해도 멈춘 지점부터 이어서 진행합니다.
 - **병렬·이어받기 다운로드.** HTTP Range 요청과 `ETag`/`If-Range` 검증을 사용하고, 원격 파일이 바뀌면 처음부터 자동으로 다시 받습니다.
 - **처음부터 끝까지 무결성 검증.** 파트가 도착할 때마다 SHA-256으로 검증하고, 전송이 끝나면 양쪽이 파일 전체를 다시 읽지 않고도 합성 체크섬을 비교합니다.
+- **폴더와 대량의 작은 파일.** 폴더 전체(또는 수천 개의 파일)를 파일별 결과와 함께 올립니다. 작은 파일은 파일당 요청 한 번으로 끝나고, 다시 실행하면 이미 올라간 파일은 건너뜁니다.
 - **정확히 한 번.** 세션 생성이 멱등적이고, `idempotency_key`로 앱의 키 하나를 업로드 하나에 대응시킬 수 있습니다. 중간에 죽거나 재시도해도 중복이 생기지 않습니다.
 - **접근 제어 내장.** 업로드는 그것을 만든 호출자의 소유가 됩니다. 서명된 grant(presigned URL)를 쓰면 브라우저나 작업 서버에 범위와 만료 시간이 정해진 권한을 줄 수 있습니다.
 - **부하에 강한 운영.** 디스크 공간 확보, 사용자별 제한, 요청 속도 제한, 완료 기록 보관 정책을 갖췄고, 장애 주입 테스트로 검증된 강제 종료 안전 상태 관리를 합니다.
-- **디스크를 두 배로 쓰지 않음.** 파트를 최종 위치에 바로 기록하므로 100GB 업로드를 완료하는 작업은 100GB 복사가 아니라 파일 이름 변경 한 번입니다.
+- **로컬 디스크 또는 S3.** 파트를 디스크의 최종 위치에 바로 기록하거나(100GB 업로드 완료가 복사가 아니라 이름 변경 한 번), S3 호환 버킷에 멀티파트 업로드로 기록합니다.
 - **프레임워크에 독립적인 코어.** 서버 코어는 외부 의존성이 없습니다. FastAPI는 연동 방식 중 하나일 뿐이고, Flask·Django·aiohttp나 직접 만든 서버에서도 같은 `UploadManager`를 호출하면 됩니다.
 - **멀티 워커 환경에서 안전.** 데이터베이스 없이도 uvicorn/gunicorn 워커 여러 개가 같은 저장 폴더를 공유할 수 있습니다.
 
 ```
 pip install "xferkit[fastapi]"   # FastAPI 서버
 pip install "xferkit[client]"    # 파이썬 클라이언트 + CLI
-pip install "xferkit[all]"       # 둘 다
+pip install "xferkit[s3]"        # S3 호환 저장소 백엔드(boto3)
+pip install "xferkit[all]"       # 위의 전부
 ```
 
 Python 3.10 이상이 필요합니다. 브라우저 클라이언트는 파이썬 패키지에 함께 들어 있습니다(npm에는 `xferkit`으로 배포).
@@ -82,6 +84,16 @@ add_cors(app, ["https://app.example.com"])      # 웹앱이 다른 출처(origin
   grant는 `X-Xferkit-Grant` 헤더나 `xk` 쿼리 파라미터로 전달합니다. 비밀키를 교체하는 동안에는 이전 키도 유효하게 둘 수 있습니다(`previous_secrets=`).
 - **정책.** `authorize=`로 작업별(`create`, `upload_part`, `complete`, `abort`, `download`, `status`) 확인을 직접 넣을 수 있습니다. 매니저의 `before_create=`로 업로드를 거절할 수 있고(용량 할당, 파일 형식 등), `rate_limit=RateLimiter(rate, burst)`를 걸면 `429`와 `Retry-After`로 응답합니다. 모든 클라이언트는 이 `Retry-After`를 따릅니다.
 
+### S3 호환 저장소
+
+```python
+from xferkit.server.s3 import S3Storage
+
+manager = UploadManager(S3Storage("my-bucket", endpoint_url="https://s3.example.com"))  # AWS, MinIO, Ceph, R2 등
+```
+
+업로드 하나가 S3 멀티파트 업로드 하나가 되어 버킷 안에서 조립됩니다. 파트는 S3로 보내기 전에 검증하고, 모든 상태를 버킷에 두므로 서버 여러 대가 한 버킷을 같이 쓸 수 있습니다. `completed.location`은 `s3://bucket/key`이고, 다운로드는 presigned URL로 리다이렉트됩니다. 파트는 최소 5MiB입니다(S3 규칙). 브라우저가 버킷에서 직접 내려받는다면 버킷에 CORS 규칙을 추가하세요.
+
 ### 디스크 공간과 보관 정책
 
 - 새 업로드는 그 크기와 진행 중인 업로드들이 앞으로 더 필요로 할 공간을 합쳐도 `min_free_bytes` 위에 들어맞아야 받습니다. 아니면 `507 insufficient_storage`로 거절합니다. `preallocate=True`(리눅스)를 켜면 공간을 처음부터 실제로 할당합니다.
@@ -106,6 +118,21 @@ print(result.upload_id, result.composite_checksum)
 download_file(url, "copy.tif", concurrency=6)
 ```
 
+폴더와 여러 파일:
+
+```python
+from xferkit.client import upload_folder
+
+result = upload_folder(
+    "https://files.example.com/uploads", "survey_2026/",
+    include="*.JPG", metadata={"project": "coastal"}, grant=grant, concurrency=8,
+)
+for failure in result.failed:
+    print(failure.path, failure.error)
+```
+
+각 파일은 원래 이름을 유지하고 `metadata["relative_path"]`에 폴더 안 경로가 담깁니다. 같은 호출을 다시 실행하면 끝나지 않은 파일은 이어서 올리고, 끝난 파일은 검증만 하고 건너뜁니다. 경로 목록에는 `upload_many([...])`를 씁니다.
+
 비동기 코드에서는 `AsyncUploader` / `AsyncDownloader`를 직접 사용합니다. 다운로더는 Range 요청을 지원하는 모든 서버(nginx, S3, CDN 등)에서 동작합니다.
 
 ## 브라우저 클라이언트
@@ -123,12 +150,22 @@ download_file(url, "copy.tif", concurrency=6)
 </script>
 ```
 
+폴더 전체(`<input type="file" webkitdirectory>`)나 폴더가 포함된 드래그 앤 드롭:
+
+```js
+import { uploadFiles, filesFromDataTransfer } from "/xferkit.mjs";
+
+const batch = await uploadFiles(folderInput.files, { baseUrl, grant, onProgress });
+dropZone.ondrop = async (e) => { e.preventDefault(); await uploadFiles(await filesFromDataTransfer(e.dataTransfer), { baseUrl, grant }); };
+```
+
 파이썬 클라이언트와 같은 것을 보장합니다. 병렬 파트 전송, 파트별 SHA-256, 합성 체크섬 검증, 새로고침이나 `AbortController.abort()` 이후 이어받기, 멱등성 키(파이썬과 공유)를 지원합니다. 자세한 내용은 [clients/js](clients/js/README.md)를 참고하세요.
 
 ## CLI
 
 ```
 xferkit upload big.tif https://example.com/uploads -c 6 --grant "$GRANT"
+xferkit upload ./survey_2026 https://example.com/uploads --include '*.JPG'   # 폴더
 xferkit download "https://example.com/uploads/abc/content?xk=..." ./big.tif -c 6
 ```
 

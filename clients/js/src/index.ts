@@ -10,6 +10,9 @@
  *   grant,                      // signed grant from your application (optional)
  *   onProgress: (p) => bar.value = p.fraction,
  * });
+ *
+ * // A whole folder (<input type="file" webkitdirectory> or a drop):
+ * const batch = await uploadFiles(folderInput.files, { baseUrl, grant });
  * ```
  */
 
@@ -33,6 +36,16 @@ export {
   type UploadResult,
   type UploadState,
 } from "./upload";
+export {
+  filesFromDataTransfer,
+  uploadFiles,
+  type BatchProgress,
+  type BatchResult,
+  type FileEntry,
+  type FileFailed,
+  type FileUploaded,
+  type UploadFilesOptions,
+} from "./batch";
 export {
   download,
   saveUrl,

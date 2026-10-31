@@ -24,6 +24,7 @@ class UploadSession:
     checksum: str | None = None
     metadata: dict[str, str] = field(default_factory=dict)
     owner: str | None = None  # principal that created it; None = anonymous
+    auto_complete: bool = False  # complete as soon as the last part arrives
 
     @property
     def total_parts(self) -> int:
@@ -65,6 +66,7 @@ class UploadSession:
             "checksum": self.checksum,
             "metadata": dict(self.metadata),
             "owner": self.owner,
+            "auto_complete": self.auto_complete,
         }
 
     @classmethod
@@ -79,6 +81,7 @@ class UploadSession:
             checksum=data.get("checksum"),
             metadata={str(k): str(v) for k, v in (data.get("metadata") or {}).items()},
             owner=None if data.get("owner") is None else str(data["owner"]),
+            auto_complete=bool(data.get("auto_complete", False)),
         )
 
 
@@ -128,7 +131,12 @@ class UploadStatus:
 
 @dataclass(frozen=True)
 class CompletedUpload:
-    """A finished upload. ``path`` is where the assembled file lives on the server."""
+    """A finished upload.
+
+    ``path`` is where the assembled file lives on the server's disk
+    (:class:`~xferkit.server.LocalStorage`). Backends that store elsewhere set
+    ``location`` (e.g. ``s3://bucket/key``) and a ``path`` relative to it.
+    """
 
     upload_id: str
     filename: str
@@ -141,6 +149,7 @@ class CompletedUpload:
     metadata: dict[str, str] = field(default_factory=dict)
     chunk_size: int = 0  # 0 for records written by xferkit < 0.1.0 final
     owner: str | None = None
+    location: str | None = None
 
     def to_dict(self, *, include_path: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -158,6 +167,8 @@ class CompletedUpload:
         }
         if include_path:
             data["path"] = str(self.path)
+            if self.location is not None:
+                data["location"] = self.location
         return data
 
     @classmethod
@@ -174,4 +185,5 @@ class CompletedUpload:
             metadata={str(k): str(v) for k, v in (data.get("metadata") or {}).items()},
             chunk_size=int(data.get("chunk_size") or 0),
             owner=None if data.get("owner") is None else str(data["owner"]),
+            location=data.get("location"),
         )

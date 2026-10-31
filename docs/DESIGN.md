@@ -128,6 +128,77 @@ the key (any string meaningful to the application) is hashed into the
 pending or completed. The load test uses one key per file and session; it
 found a duplicate in this window before the option existed.
 
+## Batches and folders
+
+Three requests per file (create, part, complete) are negligible for a 10 GB
+file and dominate for 10 000 photos. `upload_many()` / `upload_folder()` (and
+`uploadFiles()` in the browser) therefore:
+
+- create sessions 100 at a time with `POST /uploads/batch`. Files fail
+  independently: one refused file never fails the batch;
+- ask the server to complete small files (`auto_complete`, default up to
+  64 MiB) when their last part arrives, so a small file costs one request.
+  Larger files are completed explicitly: checking "are all parts here?" after
+  every part would cost a directory listing per part;
+- run several files at once, with the parts in flight across all files still
+  bounded by `concurrency`, so memory stays at `concurrency × chunk_size`;
+- create sessions only a little ahead of the transfers. Sessions created
+  far ahead would count against `max_pending_per_owner` and could expire
+  before their turn; files refused with `too_many_uploads` are queued again
+  and retried once one of the batch's own files has finished.
+
+Resuming a batch needs no local journal. With `dedupe` (the default) each
+file's idempotency key is derived from its path, name, size and modification
+time, so a re-run finds every file's session (pending or completed) through
+its client token: unfinished files continue, finished ones are only verified
+(local hash vs. the server's composite checksum), and a modified file is a new
+upload. The browser client derives the same keys from the picked folder's name
+and relative path (`webkitRelativePath`), so a folder uploaded from the
+browser is recognised by `upload_folder(root, key_prefix="<folder name>/")`
+and vice versa. Folder structure travels as `metadata["relative_path"]`;
+the server stores each file under its own name, and the application decides
+where it belongs (e.g. in `on_complete`).
+
+When two final parts of an `auto_complete` upload arrive at the same moment,
+both requests try to complete it. One wins; the other sees the session vanish
+under it and returns the winner's record. A test with many two-part files
+found this race (it produced a `500`) before the release.
+
+## S3-compatible storage
+
+`S3Storage` maps an xferkit upload onto an S3 multipart upload: part `n` is S3
+part `n + 1`, completion is `CompleteMultipartUpload`, so the object is
+assembled inside the store and the server never copies it. The protocol and
+the clients do not change; downloads are answered with a redirect to a
+presigned URL.
+
+- **Parts are verified before they reach S3.** Each part is buffered (memory up
+  to 8 MiB, then a temp file), hashed, compared with the client's checksum and
+  only then uploaded with `ChecksumSHA256`, so S3 verifies it a second time.
+- **State is objects, not a database.** Part markers are empty objects whose
+  *names* carry the part number and SHA-256 (`parts/<id>/00007-<sha256>`): one
+  `ListObjectsV2` request returns the status of up to 1000 parts. Sessions,
+  completion records and token bindings are small JSON objects. Any number of
+  servers can share one bucket.
+- **Exclusive creation** (token bindings, the completion lock) uses
+  conditional writes (`If-None-Match: *`). Concurrent writes of the same part
+  are harmless: S3 keeps the last one, and `CompleteMultipartUpload` names the
+  exact ETag of every part, so a part replaced during completion makes the
+  completion fail instead of mixing data.
+- **Crash windows.** The multipart upload is created before the session object,
+  so a crash in between leaves an orphaned multipart upload that
+  `cleanup_expired()` aborts. A crash after S3 assembled the object but before
+  the completion record was written is recovered on the next `complete`: the
+  multipart upload is gone, the object exists with the right size, and the
+  record is written then.
+- **Limits.** S3 parts must be at least 5 MiB (except the last) and an upload
+  has at most 10 000 parts; the manager picks chunk sizes accordingly.
+  An empty file is written with a single `PutObject`.
+- **Whole-file checksum.** If the client declared one, the assembled object is
+  read back once and hashed. On a mismatch the object and the session are
+  discarded (the multipart upload no longer exists, so the parts cannot be
+  re-sent).
+
 ## Client resume
 
 - **Upload:** an append-only journal (`state_dir/upload-<hash>.journal`)
@@ -218,10 +289,9 @@ any browser, a signed URL handed to the browser's own download manager
 
 ## Known limits / roadmap
 
-- Only `LocalStorage` ships today. `StorageBackend` is the extension point for
-  S3-compatible object storage (which maps naturally to multipart upload).
+- `LocalStorage` and `S3Storage` ship today. `StorageBackend` is the
+  extension point for others (Azure Blob, GCS XML API, databases for state).
 - Owner liveness checks for crash recovery work per host; with several hosts
   sharing network storage, abandoned locks are reclaimed by timeout.
 - Windows servers are not yet covered by CI.
-- Possible additions: batch/folder transfers, S3 backend, tus adapter,
-  Prometheus metrics hooks.
+- Possible additions: folder downloads, tus adapter, Prometheus metrics hooks.

@@ -52,6 +52,12 @@ class StorageBackend(abc.ABC):
     from several processes (e.g. multiple uvicorn workers) sharing the store.
     """
 
+    #: Smallest part (all but the last) the backend accepts; the manager never
+    #: chooses or accepts a smaller ``chunk_size`` for multi-part uploads.
+    min_part_size: int = 1
+    #: Most parts one upload may have.
+    max_parts: int | None = None
+
     @abc.abstractmethod
     def create(self, session: UploadSession) -> None:
         """Persist a new session and prepare space for its data."""
@@ -129,6 +135,12 @@ class StorageBackend(abc.ABC):
     def prune_tokens(self, is_live: Callable[[str], bool]) -> int:
         """Delete token bindings whose upload no longer exists. Returns the count."""
         return 0
+
+    def download_url(self, completed: CompletedUpload, *, expires_in: int = 600) -> str | None:
+        """A URL the client can be redirected to for downloading a completed
+        upload (e.g. a presigned object-storage URL), or ``None`` to have the
+        server stream ``completed.path`` itself."""
+        return None
 
     def collect_garbage(self, *, older_than: float) -> int:
         """Remove leftovers of crashed operations older than ``older_than``

@@ -9,17 +9,19 @@ xferkit moves very large files (tens or hundreds of GB) over plain HTTP:
 - **Parallel, resumable uploads.** Files are sent in parts, several at once. An interrupted upload continues where it stopped, even after the client process restarts or the page reloads.
 - **Parallel, resumable downloads.** HTTP range requests, `ETag`/`If-Range` validation, and automatic restart if the remote file changed.
 - **End-to-end integrity.** Every part is SHA-256 verified on arrival, and both sides compare a composite checksum of the whole file without re-reading it.
+- **Folders and many small files.** Upload a whole folder (or thousands of files) with per-file results; small files cost one request each, and re-running skips what is already there.
 - **Exactly once.** Session creation is idempotent and `idempotency_key` maps an application key to one upload, so crashes and retries never create duplicates.
 - **Built-in access control.** Uploads belong to the caller that created them; signed grants (presigned URLs) give browsers and workers scoped, expiring access.
 - **Safe under load.** Disk-space reservation, per-owner limits, rate limiting, retention of completion records, and crash-safe state (verified with fault injection).
-- **No double disk usage.** Parts are written straight into their final position, so completing a 100 GB upload is a rename, not a 100 GB copy.
+- **Local disk or S3.** Parts are written straight into their final position on disk (completing a 100 GB upload is a rename, not a copy), or into an S3-compatible bucket as a multipart upload.
 - **Framework-agnostic core.** The server core has zero dependencies. FastAPI is one integration; Flask, Django, aiohttp or your own server can call the same `UploadManager`.
 - **Multi-worker safe.** Several uvicorn/gunicorn workers can share one storage directory without a database.
 
 ```
 pip install "xferkit[fastapi]"   # server with FastAPI
 pip install "xferkit[client]"    # Python client + CLI
-pip install "xferkit[all]"       # both
+pip install "xferkit[s3]"        # S3-compatible storage backend (boto3)
+pip install "xferkit[all]"       # all of the above
 ```
 
 Requires Python 3.10+. The browser client is bundled with the Python package (and published as `xferkit` on npm).
@@ -82,6 +84,16 @@ Call `manager.cleanup_expired()` periodically (e.g. hourly) to remove abandoned 
   Grants travel in the `X-Xferkit-Grant` header or the `xk` query parameter. Old secrets can stay valid during rotation (`previous_secrets=`).
 - **Policies.** `authorize=` runs your own check per action (`create`, `upload_part`, `complete`, `abort`, `download`, `status`); `before_create=` on the manager can refuse uploads (quotas, file types); `rate_limit=RateLimiter(rate, burst)` answers `429` with `Retry-After`, which all clients honour.
 
+### S3-compatible storage
+
+```python
+from xferkit.server.s3 import S3Storage
+
+manager = UploadManager(S3Storage("my-bucket", endpoint_url="https://s3.example.com"))  # AWS, MinIO, Ceph, R2, ...
+```
+
+Each upload becomes an S3 multipart upload, assembled inside the bucket. Parts are verified before they are sent, all state lives in the bucket (any number of servers can share it), `completed.location` is `s3://bucket/key`, and downloads redirect to presigned URLs. Parts are at least 5 MiB (an S3 rule). Add a CORS rule to the bucket if browsers download from it.
+
 ### Disk space and retention
 
 - A new upload is refused with `507 insufficient_storage` unless its size plus the space still needed by unfinished uploads fits above `min_free_bytes`. With `preallocate=True` (Linux) the space is really allocated up front.
@@ -106,6 +118,21 @@ print(result.upload_id, result.composite_checksum)
 download_file(url, "copy.tif", concurrency=6)
 ```
 
+Folders and many files:
+
+```python
+from xferkit.client import upload_folder
+
+result = upload_folder(
+    "https://files.example.com/uploads", "survey_2026/",
+    include="*.JPG", metadata={"project": "coastal"}, grant=grant, concurrency=8,
+)
+for failure in result.failed:
+    print(failure.path, failure.error)
+```
+
+Every file keeps its name and gets `metadata["relative_path"]`. Running the same call again resumes unfinished files and skips finished ones (after verifying them). `upload_many([...])` does the same for a list of paths.
+
 Async code uses `AsyncUploader` / `AsyncDownloader` directly. The downloader works with any server that supports range requests (nginx, S3, CDNs).
 
 ## Browser client
@@ -123,12 +150,22 @@ Async code uses `AsyncUploader` / `AsyncDownloader` directly. The downloader wor
 </script>
 ```
 
+A whole folder (`<input type="file" webkitdirectory>`) or a drop with folders:
+
+```js
+import { uploadFiles, filesFromDataTransfer } from "/xferkit.mjs";
+
+const batch = await uploadFiles(folderInput.files, { baseUrl, grant, onProgress });
+dropZone.ondrop = async (e) => { e.preventDefault(); await uploadFiles(await filesFromDataTransfer(e.dataTransfer), { baseUrl, grant }); };
+```
+
 Same guarantees as the Python client: parallel parts, SHA-256 per part, composite verification, resume after reload or `AbortController.abort()`, idempotency keys (shared with Python). See [clients/js](clients/js/README.md).
 
 ## CLI
 
 ```
 xferkit upload big.tif https://example.com/uploads -c 6 --grant "$GRANT"
+xferkit upload ./survey_2026 https://example.com/uploads --include '*.JPG'   # a folder
 xferkit download "https://example.com/uploads/abc/content?xk=..." ./big.tif -c 6
 ```
 

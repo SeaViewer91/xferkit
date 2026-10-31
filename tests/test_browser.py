@@ -250,3 +250,86 @@ def test_anonymous_calls_are_rejected(servers):
 
     r = httpx.post(f"{servers['api'].url}/uploads", json={"filename": "a", "size": 1})
     assert r.status_code == 401
+
+
+async def test_folder_upload_from_browser_matches_python_keys(page, servers, tmp_path):
+    from xferkit.client import AsyncUploader
+
+    root = tmp_path / "tree"
+    contents = {
+        "a.jpg": os.urandom(3 * KiB),
+        "sub/b.jpg": os.urandom(150 * KiB),  # several parts
+        "sub/deeper/c.txt": b"hello",
+        ".DS_Store": b"junk",
+    }
+    for rel, data in contents.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_bytes(data)
+
+    await page.evaluate(
+        """() => {
+            const input = document.createElement("input");
+            input.type = "file";
+            input.webkitdirectory = true;
+            input.id = "folder";
+            document.body.append(input);
+        }"""
+    )
+    await page.set_input_files("#folder", str(root))
+    grant = upload_grant(servers)
+    result = await page.evaluate(
+        """async ({ api, grant }) => {
+            const input = document.getElementById("folder");
+            const seen = [];
+            const files = [];
+            const r = await xferkit.uploadFiles(input.files, {
+                baseUrl: api + "/uploads", grant, chunkSize: 64 * 1024,
+                metadata: { survey: "S1" },
+                onProgress: (p) => seen.push(p), onFile: (f) => files.push(f.relativePath),
+            });
+            return { ...r, last: seen[seen.length - 1], files };
+        }""",
+        {"api": servers["api"].url, "grant": grant},
+    )
+    assert result["ok"], result["failed"]
+    rels = sorted(u["relativePath"] for u in result["uploaded"])
+    assert rels == ["a.jpg", "sub/b.jpg", "sub/deeper/c.txt"]  # hidden file skipped
+    assert result["last"]["filesDone"] == 3 and result["last"]["fraction"] == 1
+    by_rel = {c.metadata["relative_path"]: c for c in servers["completed"]}
+    for rel in rels:
+        assert by_rel[rel].path.read_bytes() == contents[rel]
+        assert by_rel[rel].metadata["survey"] == "S1"
+        assert by_rel[rel].owner == "alice"
+
+    # The Python client derives the same keys for the same folder: nothing new.
+    async with AsyncUploader(f"{servers['api'].url}/uploads", grant=grant) as up:
+        again = await up.upload_folder(root, key_prefix="tree/")
+    assert again.ok and len(again.uploaded) == 3
+    assert all(r.resumed for r in again.uploaded)
+    assert len(servers["completed"]) == 3
+
+
+async def test_browser_batch_reports_failures_per_file(page, servers):
+    small = servers["signer"].issue(
+        owner="bob", prefix="/uploads", methods="*", ttl=600, max_size=1000
+    )
+    result = await page.evaluate(
+        """async ({ api, grant }) => {
+            const entries = [
+                { file: new File(["x".repeat(10)], "ok.txt"), folder: "set", relativePath: "ok.txt" },
+                { file: new File(["y".repeat(5000)], "big.txt"), folder: "set", relativePath: "d/big.txt" },
+            ];
+            const r = await xferkit.uploadFiles(entries, { baseUrl: api + "/uploads", grant });
+            return {
+                ok: r.ok,
+                uploaded: r.uploaded.map((u) => u.relativePath),
+                failed: r.failed.map((f) => [f.relativePath, f.error.code, f.error.status]),
+            };
+        }""",
+        {"api": servers["api"].url, "grant": small},
+    )
+    assert result == {
+        "ok": False,
+        "uploaded": ["ok.txt"],
+        "failed": [["d/big.txt", "payload_too_large", 413]],
+    }

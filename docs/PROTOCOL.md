@@ -39,7 +39,8 @@ Content-Type: application/json
   "chunk_size": 16777216,          // optional; server chooses if omitted
   "checksum": "sha256=<64 hex>",   // optional whole-file checksum
   "metadata": {"project": "coastal"},  // optional, string values only
-  "client_token": "q3Z...random"       // optional, recommended (see below)
+  "client_token": "q3Z...random",      // optional, recommended (see below)
+  "auto_complete": false               // optional, see section 2
 }
 ```
 
@@ -81,7 +82,11 @@ Parts are numbered `0 .. total_parts-1`. Part `n` covers bytes
 is exactly `chunk_size` bytes.
 
 When the client omits `chunk_size`, the server uses its default and grows it
-(in whole MiB) if needed to stay under its `max_parts` limit.
+(in whole MiB) if needed to stay under its `max_parts` limit. A requested
+`chunk_size` must lie between the server's minimum and maximum, except that any
+value at least as large as the file is accepted (the upload is one part).
+Storage backends can raise the minimum: S3 needs parts of at least 5 MiB and
+allows at most 10 000 parts.
 
 ## 2. Upload parts
 
@@ -98,6 +103,20 @@ X-Xferkit-Checksum: sha256=<hex of this part>   (recommended)
 ```json
 {"index": 7, "size": 16777216, "checksum": "sha256=..."}
 ```
+
+If the session was created with `"auto_complete": true` and this request
+delivered its last missing part, the server completes the upload right away
+and adds the completion record (section 4) to the response:
+
+```json
+{"index": 2, "size": 1048576, "checksum": "sha256=...",
+ "completed": {"upload_id": "Vb1k3s...", "composite_checksum": "sha256=...", ...}}
+```
+
+If that completion fails, the part is still stored and the response carries
+`"completion_error": {"code": ..., "message": ...}` instead; the client then
+calls `complete` as usual to get the error (or the record, if another request
+completed the upload in the meantime).
 
 - Parts may be sent in any order and in parallel.
 - Re-sending a part replaces it (it counts as missing until verified again).
@@ -163,7 +182,43 @@ DELETE /uploads/{upload_id}
 
 `204 No Content`. The session and its data are discarded.
 
-## 6. Download a completed upload (optional)
+## 6. Batches
+
+For many small files the three requests per file (create, part, complete)
+dominate. Two batch endpoints and auto-completion bring that down to about one.
+
+```
+POST /uploads/batch
+{"files": [ <create body>, <create body>, ... ]}      // at most 1000 (server limit)
+```
+
+`200 OK` with one entry per file, in order. Each entry is either the create
+response of section 1 plus `"created": true|false`, or an error:
+
+```json
+{"uploads": [
+  {"upload_id": "Vb1k3s...", "state": "pending", "received_parts": [], ..., "created": true},
+  {"error": {"code": "payload_too_large", "message": "..."}, "status": 413}
+]}
+```
+
+Files fail independently: a refused file does not affect the others. Client
+tokens work as in section 1, so a repeated batch returns the existing uploads
+(pending or completed). `429 too_many_uploads` entries mean the server's
+pending-upload limit is reached; send those files again once some of the
+others have finished.
+
+```
+POST /uploads/batch/status
+{"upload_ids": ["Vb1k3s...", "..."]}
+```
+
+`200 OK`, `{"uploads": [<status of section 3> | <error entry>, ...]}`.
+
+Servers that do not implement batches answer `404` or `405`; clients then fall
+back to one create request per file.
+
+## 7. Download a completed upload (optional)
 
 Only when the router is built with `expose_downloads=True`:
 
@@ -174,6 +229,9 @@ If-Range: "<etag>"
 ```
 
 Standard HTTP range semantics: `200`, `206 Partial Content`, `304`, `416`.
+Servers that keep files in object storage answer `307 Temporary Redirect` to a
+short-lived presigned URL instead; clients follow it with the same `Range` and
+`If-Range` headers (the `ETag` is then the object store's).
 
 ## Errors
 
