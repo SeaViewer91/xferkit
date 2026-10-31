@@ -26,6 +26,7 @@ Design notes:
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -41,6 +42,7 @@ from typing import Any
 
 from ..errors import (
     ChecksumMismatch,
+    InsufficientStorage,
     InvalidPart,
     InvalidRequest,
     PayloadTooLarge,
@@ -120,6 +122,13 @@ def _atomic_write_json(path: Path, data: Any, *, fsync: bool = False) -> None:
         with contextlib.suppress(OSError):
             tmp.unlink()
         raise
+
+
+_OUT_OF_SPACE = {errno.ENOSPC, getattr(errno, "EDQUOT", errno.ENOSPC)}
+
+
+def _out_of_space(exc: OSError) -> InsufficientStorage:
+    return InsufficientStorage(f"the server ran out of disk space ({exc.strerror})")
 
 
 def _read_json(path: Path) -> Any:
@@ -231,7 +240,12 @@ class LocalPartWriter:
                 f"part {self.index} is larger than the expected {self._expected} bytes",
                 details={"part": self.index, "expected_size": self._expected},
             )
-        self._fh.write(data)
+        try:
+            self._fh.write(data)
+        except OSError as exc:
+            if exc.errno in _OUT_OF_SPACE:
+                raise _out_of_space(exc) from None
+            raise
         self._hash.update(data)
         self._written += size
 
@@ -266,6 +280,11 @@ class LocalPartWriter:
             self._fh.close()
             record = PartRecord(self.index, self._written, format_checksum(digest))
             _atomic_write_json(self._marker_path, record.to_dict(), fsync=self._fsync)
+        except OSError as exc:
+            self.abort()
+            if exc.errno in _OUT_OF_SPACE:
+                raise _out_of_space(exc) from None
+            raise
         except BaseException:
             self.abort()
             raise
@@ -303,6 +322,14 @@ class LocalStorage(StorageBackend):
         part_lock_timeout: Seconds after which a part lock left by a crashed
             process is taken over.
         completion_lock_timeout: Same, for the completion lock.
+        min_free_bytes: Disk space that must stay free. A new upload is refused
+            (``507 insufficient_storage``) unless its size plus the space still
+            needed by unfinished uploads fits above this reserve. ``None``
+            disables the check.
+        preallocate: Really allocate each upload's space at creation
+            (``posix_fallocate``, Linux) instead of a sparse file, so the disk
+            can never fill up mid-upload. Fast on ext4/XFS; on filesystems
+            without native support it writes zeros, so leave it off there.
     """
 
     SESSION_FILE = "session.json"
@@ -319,9 +346,13 @@ class LocalStorage(StorageBackend):
         fsync: bool = False,
         part_lock_timeout: float = 600.0,
         completion_lock_timeout: float = 3600.0,
+        min_free_bytes: int | None = 1024**3,
+        preallocate: bool = False,
     ) -> None:
         self.root = Path(root).resolve()
         self.fsync = fsync
+        self.min_free_bytes = min_free_bytes
+        self.preallocate = preallocate and hasattr(os, "posix_fallocate")
         self.part_lock_timeout = part_lock_timeout
         self.completion_lock_timeout = completion_lock_timeout
         self._uploads = self.root / "uploads"
@@ -350,17 +381,53 @@ class LocalStorage(StorageBackend):
         directory = self._dir(session.upload_id)
         if directory.exists():
             raise UploadConflict(f"upload {session.upload_id!r} already exists")
+        self.check_space(session.size)
         staging = self._uploads / f"{self.STAGING_PREFIX}{session.upload_id}"
         try:
             staging.mkdir()
             (staging / self.PARTS_DIR).mkdir()
             with open(staging / self.DATA_FILE, "wb") as fh:
                 fh.truncate(session.size)  # sparse where the filesystem supports it
+                if self.preallocate and session.size:
+                    os.posix_fallocate(fh.fileno(), 0, session.size)
             _atomic_write_json(staging / self.SESSION_FILE, session.to_dict(), fsync=self.fsync)
             os.rename(staging, directory)
+        except OSError as exc:
+            shutil.rmtree(staging, ignore_errors=True)
+            if exc.errno in _OUT_OF_SPACE:
+                raise _out_of_space(exc) from None
+            raise
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
             raise
+
+    def outstanding_bytes(self) -> int:
+        """Space unfinished uploads still need: declared size minus what is
+        already allocated on disk (sparse data files grow as parts arrive)."""
+        total = 0
+        for entry in os.scandir(self._uploads):
+            if entry.name.startswith(".") or not entry.is_dir():
+                continue
+            try:
+                stat = os.stat(os.path.join(entry.path, self.DATA_FILE))
+            except FileNotFoundError:
+                continue
+            allocated = getattr(stat, "st_blocks", 0) * 512
+            total += max(0, stat.st_size - allocated)
+        return total
+
+    def check_space(self, size: int) -> None:
+        """Raise ``InsufficientStorage`` if ``size`` more bytes would eat into
+        ``min_free_bytes`` once all unfinished uploads are complete."""
+        if self.min_free_bytes is None:
+            return
+        free = shutil.disk_usage(self.root).free
+        required = size + self.outstanding_bytes() + self.min_free_bytes
+        if free < required:
+            raise InsufficientStorage(
+                "not enough free disk space for this upload",
+                details={"free_bytes": free, "required_bytes": required},
+            )
 
     def load(self, upload_id: str) -> UploadSession:
         path = self._dir(upload_id) / self.SESSION_FILE
@@ -533,6 +600,7 @@ class LocalStorage(StorageBackend):
             completed_at=time.time(),
             metadata=dict(session.metadata),
             chunk_size=session.chunk_size,
+            owner=session.owner,
         )
         record = completed.to_dict()
         record["path"] = target.relative_to(self.root).as_posix()
@@ -549,6 +617,14 @@ class LocalStorage(StorageBackend):
         except FileNotFoundError:
             return None
         return CompletedUpload.from_dict(data, path=self.root / data["path"])
+
+    def iter_completed(self) -> Iterator[CompletedUpload]:
+        for path in self._records.glob("*.json"):
+            if path.name.startswith("."):
+                continue
+            completed = self.get_completed(path.stem)
+            if completed is not None:
+                yield completed
 
     def delete_completed(self, upload_id: str, *, remove_file: bool = True) -> None:
         completed = self.get_completed(upload_id)

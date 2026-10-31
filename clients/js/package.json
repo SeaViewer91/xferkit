@@ -1,0 +1,36 @@
+{
+  "name": "xferkit",
+  "version": "0.1.0",
+  "description": "Browser client for xferkit: parallel, resumable, verified large-file uploads and downloads",
+  "license": "MIT",
+  "author": "SeaViewer91",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SeaViewer91/xferkit.git",
+    "directory": "clients/js"
+  },
+  "keywords": ["upload", "download", "resumable", "chunked-upload", "multipart", "range-requests"],
+  "type": "module",
+  "main": "./dist/xferkit.mjs",
+  "module": "./dist/xferkit.mjs",
+  "types": "./dist/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/xferkit.mjs"
+    }
+  },
+  "files": ["dist", "src", "README.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "npm run typecheck && npm run bundle && npm run types && npm run vendor",
+    "typecheck": "tsc --noEmit",
+    "bundle": "esbuild src/index.ts --bundle --format=esm --target=es2020 --sourcemap --outfile=dist/xferkit.mjs",
+    "types": "tsc --emitDeclarationOnly --declaration --outDir dist/types",
+    "vendor": "node scripts/vendor.mjs"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "typescript": "5.9.3"
+  }
+}

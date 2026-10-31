@@ -149,11 +149,79 @@ found a duplicate in this window before the option existed.
 - Client: memory is about `concurrency × chunk_size` for uploads and
   `concurrency × 1 MiB` for downloads.
 
+## Security model
+
+- **Identity is the application's business.** The transfer server does not
+  manage users. The router asks `principal(request)` who is calling, or accepts
+  a signed grant issued by the application. Both yield an *owner* id.
+- **Ownership instead of ACLs.** Every upload records its owner. All
+  operations on it (status, parts, complete, abort, download) are refused with
+  `404` for any other caller — the same answer as for an unknown id, so ids
+  cannot be probed. Client tokens are hashed together with the owner, so one
+  user can never reach another user's upload through a token either. Uploads
+  without an owner keep the original "the id is the capability" behaviour.
+- **Grants are stateless capabilities.** `v1.<payload>.<HMAC-SHA256>`, carrying
+  owner, path prefix, methods, expiry and an optional upload size limit. They
+  are verified with a shared secret, so any number of transfer servers can
+  check them without a database, and the issuing application can live
+  elsewhere (e.g. a cloud web app issuing grants for an on-premise transfer
+  server). Prefixes match whole path segments (`/uploads` does not cover
+  `/uploads2`). `previous_secrets` allows rotating the secret. Grants in URLs
+  (`?xk=`) end up in logs and browser history, so keep their `ttl` short and
+  their prefix narrow.
+- **Policy hooks** — `authorize` (per request, async) and `before_create`
+  (per new upload, sync) — let applications add quotas, file-type rules or
+  roles without forking the router.
+- **Rate limiting** is a per-process token bucket keyed by owner or client
+  address; it protects the server from runaway clients rather than enforcing
+  exact global quotas (use a gateway for that). Clients honour `Retry-After`.
+
+## Disk space
+
+Session data files are sparse: they occupy only what has been written. To
+avoid accepting uploads that cannot finish, `LocalStorage` checks at creation
+that `size + outstanding + min_free_bytes <= free`, where *outstanding* is the
+space still needed by unfinished uploads (declared size minus allocated blocks,
+read from `stat` — no index to keep in sync). Two uploads created at the same
+instant may both pass the check, so `min_free_bytes` doubles as a safety
+margin. With `preallocate=True` the space is reserved for real with
+`posix_fallocate`. A full disk during a part write is reported as
+`507 insufficient_storage` instead of a generic error.
+
+## Retention
+
+Completion records let crashed clients recognise finished uploads (and keep
+`idempotency_key` working), so they cannot be dropped immediately. They expire
+after `completed_ttl` (default 7 days); `remove_files_on_expiry` also deletes
+the assembled file for deployments that serve files straight from the store.
+Token bindings disappear with their upload.
+
+## Browser client
+
+The browser client (`clients/js`, TypeScript, no dependencies) implements the
+same protocol and guarantees as the Python client. Two browser-specific
+decisions:
+
+- Each part is read once to hash it with WebCrypto, and the **`Blob` slice
+  itself** is sent as the request body. Chromium copies `ArrayBuffer` bodies
+  between processes and uploaded about 8× slower that way (17 vs 137 MiB/s in
+  a micro-benchmark), while `Blob` bodies are streamed from the file.
+- Resume state (client token and upload id) is kept in `localStorage`; part
+  digests are not persisted but recomputed from the file when needed.
+  Idempotency keys are hashed exactly like in Python, so the same key refers to
+  the same upload from both clients.
+
+Downloads go into a `Blob` or, for files larger than memory, into a
+`FileSystemWritableFileStream` with positional writes; for arbitrary sizes in
+any browser, a signed URL handed to the browser's own download manager
+(`saveUrl`) is the simplest option.
+
 ## Known limits / roadmap
 
 - Only `LocalStorage` ships today. `StorageBackend` is the extension point for
   S3-compatible object storage (which maps naturally to multipart upload).
-- No built-in authentication: protect the router with FastAPI dependencies.
+- Owner liveness checks for crash recovery work per host; with several hosts
+  sharing network storage, abandoned locks are reclaimed by timeout.
 - Windows servers are not yet covered by CI.
-- Possible additions: tus adapter for browser clients, a browser JS client,
-  upload-size quotas per user, Prometheus metrics hooks.
+- Possible additions: batch/folder transfers, S3 backend, tus adapter,
+  Prometheus metrics hooks.

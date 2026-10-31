@@ -10,6 +10,11 @@ Mount the upload protocol::
     app = FastAPI()
     app.include_router(create_upload_router(manager, prefix="/uploads"))
 
+Authentication (who is calling) is pluggable: pass ``principal=`` to identify
+callers with your own auth (session cookie, JWT, API key, ...) and/or
+``grants=`` to accept signed grants (presigned URLs). Uploads created by a
+caller belong to it and are invisible to everybody else.
+
 Serve any file with resumable, parallel-friendly range support::
 
     from xferkit.integrations.fastapi import range_file_response
@@ -24,30 +29,73 @@ in full. Blocking file I/O runs in Starlette's thread pool.
 """
 
 import inspect
-from collections.abc import Callable, Sequence
+import math
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Request
 from fastapi.params import Depends
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from ..errors import InvalidPart, XferkitError
+from ..errors import (
+    Forbidden,
+    InvalidGrant,
+    InvalidPart,
+    PayloadTooLarge,
+    RateLimited,
+    Unauthorized,
+    UploadNotFound,
+    XferkitError,
+)
+from ..grants import GRANT_HEADER, GRANT_QUERY, Grant, GrantSigner
 from ..models import CompletedUpload
 from ..protocol import CHECKSUM_HEADER, PROTOCOL_HEADER, PROTOCOL_VERSION, MiB
 from ..server.download import iter_file_range, plan_file_response
 from ..server.manager import UploadManager
+from ..server.ratelimit import RateLimiter
 
 __all__ = [
+    "CORS_ALLOW_HEADERS",
+    "CORS_EXPOSE_HEADERS",
+    "AccessContext",
+    "Caller",
     "CreateUploadRequest",
+    "add_cors",
     "create_upload_router",
     "error_response",
+    "mount_browser_client",
     "range_file_response",
+    "require_grant",
 ]
 
 CompleteCallback = Callable[[CompletedUpload, Request], Any]
+PrincipalResolver = Callable[[Request], "Awaitable[str | None] | str | None"]
+
+#: Request headers a browser client sends (for ``Access-Control-Allow-Headers``).
+CORS_ALLOW_HEADERS = [
+    "Authorization",
+    "Content-Type",
+    "If-Range",
+    "Range",
+    CHECKSUM_HEADER,
+    GRANT_HEADER,
+]
+#: Response headers a browser client must be able to read.
+CORS_EXPOSE_HEADERS = [
+    "Accept-Ranges",
+    "Content-Disposition",
+    "Content-Length",
+    "Content-Range",
+    "ETag",
+    "Last-Modified",
+    "Location",
+    "Retry-After",
+    PROTOCOL_HEADER,
+]
 
 _BASE_HEADERS = {PROTOCOL_HEADER: PROTOCOL_VERSION}
 
@@ -74,13 +122,53 @@ class CreateUploadRequest(BaseModel):
     )
 
 
+@dataclass(frozen=True)
+class Caller:
+    """Who is making a request (also available as ``request.state.xferkit_caller``)."""
+
+    owner: str | None
+    grant: Grant | None = None
+
+    @property
+    def authenticated(self) -> bool:
+        return self.owner is not None or self.grant is not None
+
+
+@dataclass(frozen=True)
+class AccessContext:
+    """Passed to the ``authorize`` hook."""
+
+    caller: Caller
+    action: str  # "create", "status", "upload_part", "complete", "abort", "download"
+    upload_id: str | None = None
+    create: CreateUploadRequest | None = None
+
+
+Authorizer = Callable[[Request, AccessContext], "Awaitable[bool | None] | bool | None"]
+
+
 def error_response(exc: XferkitError) -> JSONResponse:
     """Turn an :class:`XferkitError` into the protocol's JSON error response."""
-    return JSONResponse(exc.to_dict(), status_code=exc.status_code, headers=_BASE_HEADERS)
+    headers = dict(_BASE_HEADERS)
+    retry_after = exc.details.get("retry_after")
+    if retry_after is not None:
+        headers["Retry-After"] = str(math.ceil(float(retry_after)))
+    if isinstance(exc, Unauthorized):
+        headers["WWW-Authenticate"] = "Xferkit-Grant"
+    return JSONResponse(exc.to_dict(), status_code=exc.status_code, headers=headers)
 
 
 def _json(data: Any, status_code: int = 200, headers: dict[str, str] | None = None) -> JSONResponse:
     return JSONResponse(data, status_code=status_code, headers={**_BASE_HEADERS, **(headers or {})})
+
+
+async def _maybe_await(value: Any) -> Any:
+    return await value if inspect.isawaitable(value) else value
+
+
+def _grant_names_upload(grant: Grant | None, upload_id: str) -> bool:
+    """A grant whose path names one specific upload is a capability for it."""
+    return grant is not None and upload_id in grant.prefix.strip("/").split("/")
 
 
 def create_upload_router(
@@ -89,6 +177,11 @@ def create_upload_router(
     prefix: str = "/uploads",
     tags: Sequence[str] = ("xferkit",),
     dependencies: Sequence[Depends] | None = None,
+    principal: PrincipalResolver | None = None,
+    grants: GrantSigner | None = None,
+    require_auth: bool = False,
+    authorize: Authorizer | None = None,
+    rate_limit: RateLimiter | None = None,
     on_complete: CompleteCallback | None = None,
     expose_downloads: bool = False,
     write_buffer_size: int = MiB,
@@ -99,23 +192,81 @@ def create_upload_router(
         manager: The :class:`UploadManager` that stores the uploads.
         prefix: URL prefix of the protocol endpoints.
         tags: OpenAPI tags.
-        dependencies: Router-level dependencies, e.g. ``[Depends(require_user)]``
-            to protect every endpoint.
+        dependencies: Extra router-level FastAPI dependencies.
+        principal: Identifies the caller with your own authentication: called
+            with the request, returns an owner id (``str``) or ``None`` for an
+            anonymous caller; may be ``async`` and may raise ``HTTPException``.
+            Uploads belong to the caller that created them; other callers get
+            ``404`` for them.
+        grants: Accept signed grants (``X-Xferkit-Grant`` header or ``xk``
+            query parameter) issued with this :class:`GrantSigner`. A valid
+            grant authenticates the request as the grant's owner.
+        require_auth: Reject requests that are neither identified by
+            ``principal`` nor carry a valid grant (``401``).
+        authorize: Extra policy hook ``(request, AccessContext) -> bool``;
+            returning ``False`` answers ``403``.
+        rate_limit: Per-caller request rate limit (``429`` + ``Retry-After``).
         on_complete: Called once per finished upload with
             ``(completed, request)``; may be sync or ``async``. Runs after
-            ``manager.on_complete``. Use it for request-scoped work (who
-            uploaded it, DB rows, background jobs).
+            ``manager.on_complete``. ``request.state.xferkit_caller`` tells who
+            uploaded it.
         expose_downloads: Also add ``GET/HEAD {prefix}/{upload_id}/content``
-            serving completed uploads with range support. Off by default:
-            anyone who knows an upload id could read the file.
+            serving completed uploads with range support (subject to the same
+            ownership rules, or to a grant naming the upload).
         write_buffer_size: Bytes buffered before each hand-off to the I/O thread.
     """
     router = APIRouter(prefix=prefix, tags=list(tags), dependencies=list(dependencies or []))
     root = "" if prefix else "/"
 
+    async def resolve_caller(request: Request) -> Caller:
+        token = request.headers.get(GRANT_HEADER) or request.query_params.get(GRANT_QUERY)
+        if token:
+            if grants is None:
+                raise InvalidGrant("this server does not accept grants")
+            grant = grants.verify(token, method=request.method, path=request.url.path)
+            return Caller(owner=grant.owner, grant=grant)
+        owner = await _maybe_await(principal(request)) if principal is not None else None
+        caller = Caller(owner=owner)
+        if require_auth and not caller.authenticated:
+            raise Unauthorized("authentication required")
+        return caller
+
+    async def guard(
+        request: Request,
+        action: str,
+        *,
+        upload_id: str | None = None,
+        create: CreateUploadRequest | None = None,
+        check_owner: bool = True,
+    ) -> Caller:
+        caller = await resolve_caller(request)
+        request.state.xferkit_caller = caller
+        if rate_limit is not None:
+            key = caller.owner or f"ip:{request.client.host if request.client else '?'}"
+            wait = rate_limit.acquire(key)
+            if wait > 0:
+                raise RateLimited("too many requests", details={"retry_after": wait})
+        if (
+            upload_id is not None
+            and check_owner
+            and not _grant_names_upload(caller.grant, upload_id)
+        ):
+            await run_in_threadpool(manager.ensure_access, upload_id, caller.owner)
+        if authorize is not None:
+            context = AccessContext(caller, action, upload_id, create)
+            if await _maybe_await(authorize(request, context)) is False:
+                raise Forbidden(f"not allowed to {action.replace('_', ' ')}")
+        return caller
+
     @router.post(root, status_code=201, summary="Create an upload session")
     async def create_upload(body: CreateUploadRequest, request: Request) -> Response:
         try:
+            caller = await guard(request, "create", create=body)
+            limit = caller.grant.max_size if caller.grant is not None else None
+            if limit is not None and body.size > limit:
+                raise PayloadTooLarge(
+                    "file is larger than this grant allows", details={"max_size": limit}
+                )
             state, created = await run_in_threadpool(
                 lambda: manager.open_upload(
                     body.filename,
@@ -124,6 +275,7 @@ def create_upload_router(
                     checksum=body.checksum,
                     metadata=body.metadata,
                     client_token=body.client_token,
+                    owner=caller.owner,
                 )
             )
         except XferkitError as exc:
@@ -132,8 +284,9 @@ def create_upload_router(
         return _json(state, 201 if created else 200, {"Location": location})
 
     @router.get("/{upload_id}", name=f"{_name(prefix)}_status", summary="Upload status")
-    async def get_status(upload_id: str) -> Response:
+    async def get_status(upload_id: str, request: Request) -> Response:
         try:
+            await guard(request, "status", upload_id=upload_id)
             status = await run_in_threadpool(manager.describe, upload_id)
         except XferkitError as exc:
             return error_response(exc)
@@ -142,7 +295,14 @@ def create_upload_router(
     @router.put("/{upload_id}/parts/{index}", summary="Upload one part (raw request body)")
     async def put_part(upload_id: str, index: int, request: Request) -> Response:
         try:
+            caller = await guard(request, "upload_part", upload_id=upload_id, check_owner=False)
             session = await run_in_threadpool(manager.get_session, upload_id)
+            if (
+                session.owner is not None
+                and session.owner != caller.owner
+                and not _grant_names_upload(caller.grant, upload_id)
+            ):
+                raise UploadNotFound(f"upload {upload_id!r} not found")
             expected = session.part_size(index)
             declared = request.headers.get("content-length")
             if declared is not None and declared.strip() != str(expected):
@@ -175,18 +335,18 @@ def create_upload_router(
     @router.post("/{upload_id}/complete", summary="Assemble and verify the upload")
     async def complete_upload(upload_id: str, request: Request) -> Response:
         try:
+            await guard(request, "complete", upload_id=upload_id)
             completed, created = await run_in_threadpool(manager.complete_upload, upload_id)
         except XferkitError as exc:
             return error_response(exc)
         if created and on_complete is not None:
-            result = on_complete(completed, request)
-            if inspect.isawaitable(result):
-                await result
+            await _maybe_await(on_complete(completed, request))
         return _json(completed.to_dict())
 
     @router.delete("/{upload_id}", status_code=204, summary="Abort the upload")
-    async def abort_upload(upload_id: str) -> Response:
+    async def abort_upload(upload_id: str, request: Request) -> Response:
         try:
+            await guard(request, "abort", upload_id=upload_id)
             await run_in_threadpool(manager.abort, upload_id)
         except XferkitError as exc:
             return error_response(exc)
@@ -198,6 +358,7 @@ def create_upload_router(
         @router.get("/{upload_id}/content", summary="Download a completed upload (supports Range)")
         async def download_completed(upload_id: str, request: Request) -> Response:
             try:
+                await guard(request, "download", upload_id=upload_id)
                 completed = await run_in_threadpool(manager.get_completed, upload_id)
             except XferkitError as exc:
                 return error_response(exc)
@@ -209,6 +370,52 @@ def create_upload_router(
 def _name(prefix: str) -> str:
     cleaned = "".join(ch if ch.isalnum() else "_" for ch in prefix).strip("_")
     return f"xferkit_{cleaned}" if cleaned else "xferkit"
+
+
+def add_cors(
+    app: FastAPI,
+    origins: Sequence[str],
+    *,
+    allow_credentials: bool = False,
+    max_age: int = 600,
+) -> None:
+    """Allow browser clients served from ``origins`` to use the transfer API.
+
+    Sets the request and response headers the xferkit browser client needs.
+    Set ``allow_credentials`` if the browser authenticates with cookies.
+    """
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(origins),
+        allow_methods=["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=CORS_ALLOW_HEADERS,
+        expose_headers=CORS_EXPOSE_HEADERS,
+        allow_credentials=allow_credentials,
+        max_age=max_age,
+    )
+
+
+def mount_browser_client(app: FastAPI | APIRouter, path: str = "/xferkit.mjs") -> None:
+    """Serve the bundled browser client (an ES module) at ``path``::
+
+    mount_browser_client(app)
+    # <script type="module">
+    #   import { upload } from "/xferkit.mjs";
+    # </script>
+    """
+    from ..static import BROWSER_CLIENT
+
+    @app.get(path, include_in_schema=False)
+    async def browser_client(request: Request) -> Response:
+        return range_file_response(
+            request,
+            BROWSER_CLIENT,
+            media_type="text/javascript; charset=utf-8",
+            disposition=None,
+            headers={"Cache-Control": "public, max-age=3600"},
+        )
 
 
 def range_file_response(
@@ -245,3 +452,25 @@ def range_file_response(
         status_code=plan.status,
         headers=response_headers,
     )
+
+
+def require_grant(signer: GrantSigner) -> Callable[[Request], Awaitable[Grant]]:
+    """FastAPI dependency protecting your own routes (e.g. a
+    :func:`range_file_response` route) with signed grants::
+
+        @app.get("/files/{name}")
+        async def get_file(name: str, request: Request,
+                           grant: Grant = Depends(require_grant(signer))):
+            ...
+    """
+
+    async def dependency(request: Request) -> Grant:
+        token = request.headers.get(GRANT_HEADER) or request.query_params.get(GRANT_QUERY)
+        if not token:
+            raise HTTPException(status_code=401, detail="a signed grant is required")
+        try:
+            return signer.verify(token, method=request.method, path=request.url.path)
+        except InvalidGrant as exc:
+            raise HTTPException(status_code=401, detail=exc.message) from None
+
+    return dependency

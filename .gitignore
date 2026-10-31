@@ -31,3 +31,7 @@ xferkit-data/
 loadtest-data/
 *.xferkit-part
 *.xferkit-state
+
+# Browser client build output (the copy in src/xferkit/static is committed)
+clients/js/node_modules/
+clients/js/dist/

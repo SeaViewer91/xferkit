@@ -20,6 +20,7 @@ from ..errors import (
     UploadIncomplete,
     UploadNotFound,
 )
+from ..grants import GRANT_HEADER
 from ..protocol import CHECKSUM_HEADER, MiB, composite_checksum, format_checksum, total_parts
 from ._common import (
     Journal,
@@ -120,6 +121,8 @@ class AsyncUploader:
             ``concurrency * chunk_size``.
         retry: Retry policy for network errors and 5xx/429 responses.
         timeout: httpx timeout (default 60 s, 15 s connect).
+        grant: A signed grant (see :mod:`xferkit.grants`) sent with every
+            request, for servers that require one.
         state_dir: Directory for resume journals. When set, re-running an
             interrupted upload of the same file continues where it stopped.
         send_checksum: Hash the whole file first and let the server verify it
@@ -138,6 +141,7 @@ class AsyncUploader:
         concurrency: int = 4,
         retry: RetryPolicy | None = None,
         timeout: httpx.Timeout | float | None = None,
+        grant: str | None = None,
         state_dir: str | Path | None = None,
         send_checksum: bool = False,
     ) -> None:
@@ -149,6 +153,8 @@ class AsyncUploader:
         self.retry = retry or RetryPolicy()
         self.state_dir = Path(state_dir).expanduser() if state_dir else None
         self.send_checksum = send_checksum
+        if grant is not None:
+            headers = {**(headers or {}), GRANT_HEADER: grant}
         self._client, self._owns_client = make_client(
             client, headers=headers, timeout=timeout, concurrency=concurrency
         )

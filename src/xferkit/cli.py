@@ -80,6 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     up.add_argument("-c", "--concurrency", type=int, default=4)
     up.add_argument("--meta", action="append", default=[], metavar="KEY=VALUE")
     up.add_argument("-H", "--header", action="append", default=[], metavar="'NAME: VALUE'")
+    up.add_argument("--grant", help="signed grant token issued by the server's application")
     up.add_argument("--upload-id", help="resume this upload session")
     up.add_argument(
         "--idempotency-key", help="re-running with the same key never uploads a second copy"
@@ -94,6 +95,7 @@ def _build_parser() -> argparse.ArgumentParser:
     down.add_argument("-c", "--concurrency", type=int, default=4)
     down.add_argument("--segment-size", type=parse_size, default=16 * MiB)
     down.add_argument("-H", "--header", action="append", default=[], metavar="'NAME: VALUE'")
+    down.add_argument("--grant", help="signed grant token (or put it in the URL as ?xk=...)")
     down.add_argument("--checksum", help="expected sha256=<hex>")
     down.add_argument("--overwrite", action="store_true")
     down.add_argument("--no-resume", action="store_true")
@@ -122,6 +124,7 @@ def main(argv: list[str] | None = None) -> int:
                 idempotency_key=args.idempotency_key,
                 progress=printer,
                 headers=_headers(args.header),
+                grant=args.grant,
                 chunk_size=args.chunk_size,
                 concurrency=args.concurrency,
                 state_dir=args.state_dir,
@@ -139,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
                 checksum=args.checksum,
                 progress=printer,
                 headers=_headers(args.header),
+                grant=args.grant,
                 concurrency=args.concurrency,
                 segment_size=args.segment_size,
             )

@@ -23,3 +23,25 @@ jobs:
       - run: ruff check src tests
       - run: ruff format --check src tests
       - run: pytest -q
+
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the browser client
+        working-directory: clients/js
+        run: |
+          npm ci
+          npm run build
+      - name: Bundled copy in the Python package is up to date
+        run: git diff --exit-code src/xferkit/static/xferkit.mjs
+      - run: python -m pip install -e ".[dev]" playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: Browser tests (real Chromium)
+        run: pytest -q tests/test_browser.py

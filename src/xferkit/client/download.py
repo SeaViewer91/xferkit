@@ -20,6 +20,7 @@ from typing import IO, Any
 import httpx
 
 from ..errors import IntegrityError, RemoteChangedError, TransferError
+from ..grants import GRANT_HEADER
 from ..protocol import MiB, format_checksum, parse_checksum
 from ._common import (
     Journal,
@@ -102,6 +103,8 @@ class AsyncDownloader:
         segment_size: Bytes per range request.
         retry: Retry policy for network errors and 5xx/429 responses.
         timeout: httpx timeout (default 60 s, 15 s connect).
+        grant: A signed grant (see :mod:`xferkit.grants`) sent with every
+            request, for servers that require one.
 
     While downloading, data goes to ``<dest>.xferkit-part`` and progress to
     ``<dest>.xferkit-state``. Running the same download again resumes, as long
@@ -117,6 +120,7 @@ class AsyncDownloader:
         segment_size: int = 16 * MiB,
         retry: RetryPolicy | None = None,
         timeout: httpx.Timeout | float | None = None,
+        grant: str | None = None,
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency must be >= 1")
@@ -125,6 +129,8 @@ class AsyncDownloader:
         self.concurrency = concurrency
         self.segment_size = segment_size
         self.retry = retry or RetryPolicy()
+        if grant is not None:
+            headers = {**(headers or {}), GRANT_HEADER: grant}
         self._client, self._owns_client = make_client(
             client, headers=headers, timeout=timeout, concurrency=concurrency
         )

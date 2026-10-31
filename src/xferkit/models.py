@@ -23,6 +23,7 @@ class UploadSession:
     expires_at: float | None = None
     checksum: str | None = None
     metadata: dict[str, str] = field(default_factory=dict)
+    owner: str | None = None  # principal that created it; None = anonymous
 
     @property
     def total_parts(self) -> int:
@@ -63,6 +64,7 @@ class UploadSession:
             "expires_at": self.expires_at,
             "checksum": self.checksum,
             "metadata": dict(self.metadata),
+            "owner": self.owner,
         }
 
     @classmethod
@@ -76,6 +78,7 @@ class UploadSession:
             expires_at=None if data.get("expires_at") is None else float(data["expires_at"]),
             checksum=data.get("checksum"),
             metadata={str(k): str(v) for k, v in (data.get("metadata") or {}).items()},
+            owner=None if data.get("owner") is None else str(data["owner"]),
         )
 
 
@@ -137,6 +140,7 @@ class CompletedUpload:
     completed_at: float
     metadata: dict[str, str] = field(default_factory=dict)
     chunk_size: int = 0  # 0 for records written by xferkit < 0.1.0 final
+    owner: str | None = None
 
     def to_dict(self, *, include_path: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -150,6 +154,7 @@ class CompletedUpload:
             "created_at": self.created_at,
             "completed_at": self.completed_at,
             "metadata": dict(self.metadata),
+            "owner": self.owner,
         }
         if include_path:
             data["path"] = str(self.path)
@@ -168,4 +173,5 @@ class CompletedUpload:
             completed_at=float(data["completed_at"]),
             metadata={str(k): str(v) for k, v in (data.get("metadata") or {}).items()},
             chunk_size=int(data.get("chunk_size") or 0),
+            owner=None if data.get("owner") is None else str(data["owner"]),
         )

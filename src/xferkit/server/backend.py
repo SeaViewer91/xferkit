@@ -107,6 +107,10 @@ class StorageBackend(abc.ABC):
     def iter_sessions(self) -> Iterator[UploadSession]:
         """Iterate over all pending sessions (used for expiry cleanup)."""
 
+    def iter_completed(self) -> Iterator[CompletedUpload]:
+        """Iterate over completion records (used for retention). Optional."""
+        return iter(())
+
     # Idempotent creation. Optional: the defaults disable it (every create is new).
 
     def lookup_token(self, token: str) -> str | None:

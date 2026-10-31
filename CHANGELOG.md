@@ -14,6 +14,22 @@ First version.
 - `xferkit` CLI.
 - Load test suite (`benchmarks/load`): ~10 MB synthetic images, 10 concurrent
   client sessions, multi-worker server, fault injection.
+- Access control: uploads belong to their creator (`owner`); `principal=`,
+  `require_auth=`, `authorize=` hooks on the FastAPI router; other callers get
+  `404`.
+- Signed grants (`GrantSigner`): stateless, scoped, expiring credentials and
+  presigned URLs (`X-Xferkit-Grant` header or `xk` query parameter), secret
+  rotation, per-grant upload size limit; `grant=` in the Python clients and CLI.
+- Disk-space admission (`min_free_bytes`, accounting for unfinished uploads),
+  optional `preallocate`, `507 insufficient_storage` on a full disk.
+- Retention of completion records (`completed_ttl`, `remove_files_on_expiry`).
+- Limits: `max_pending_uploads`, `max_pending_per_owner`,
+  `max_pending_bytes_per_owner` (`429 too_many_uploads`), `before_create` hook,
+  per-caller `RateLimiter` (`429` + `Retry-After`).
+- Browser client (`clients/js`, TypeScript, also served by
+  `mount_browser_client`): parallel resumable verified uploads, ranged
+  downloads to Blob or disk, grants, abort/resume, idempotency keys shared
+  with Python; `add_cors` helper.
 
 ### Fixed by the load test
 

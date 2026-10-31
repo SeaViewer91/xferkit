@@ -93,6 +93,52 @@ class UploadIncomplete(UploadConflict):
     code = "upload_incomplete"
 
 
+class Unauthorized(XferkitError):
+    """The request carries no (valid) credentials."""
+
+    status_code = 401
+    code = "unauthorized"
+
+
+class InvalidGrant(Unauthorized):
+    """A signed grant is malformed, forged, expired or does not cover the request."""
+
+    code = "invalid_grant"
+
+
+class Forbidden(XferkitError):
+    """The caller is known but not allowed to do this."""
+
+    status_code = 403
+    code = "forbidden"
+
+
+class QuotaExceeded(Forbidden):
+    """The caller's quota does not allow this upload."""
+
+    code = "quota_exceeded"
+
+
+class RateLimited(XferkitError):
+    """Too many requests; ``details["retry_after"]`` says how long to wait."""
+
+    status_code = 429
+    code = "rate_limited"
+
+
+class TooManyUploads(RateLimited):
+    """Too many uploads in progress; finish or abort some first."""
+
+    code = "too_many_uploads"
+
+
+class InsufficientStorage(XferkitError):
+    """The server does not have enough free disk space for this upload."""
+
+    status_code = 507
+    code = "insufficient_storage"
+
+
 class RangeNotSatisfiable(XferkitError):
     """The requested byte range lies outside the file."""
 
@@ -134,6 +180,13 @@ _ERRORS_BY_CODE: dict[str, type[XferkitError]] = {
         UploadConflict,
         UploadIncomplete,
         RangeNotSatisfiable,
+        Unauthorized,
+        InvalidGrant,
+        Forbidden,
+        QuotaExceeded,
+        RateLimited,
+        TooManyUploads,
+        InsufficientStorage,
     )
 }
 

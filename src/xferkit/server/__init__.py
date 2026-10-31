@@ -11,14 +11,17 @@ from .download import (
     plan_file_response,
 )
 from .local import LocalPartWriter, LocalStorage, safe_filename, sha256_file, validate_upload_id
-from .manager import UploadManager
+from .manager import CreateRequest, UploadManager
+from .ratelimit import RateLimiter
 
 __all__ = [
     "ByteRange",
+    "CreateRequest",
     "FilePlan",
     "LocalPartWriter",
     "LocalStorage",
     "PartSink",
+    "RateLimiter",
     "StorageBackend",
     "UploadManager",
     "content_disposition",

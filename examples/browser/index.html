@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xferkit demo</title>
+<style>
+  :root { --bg: #f7f7f5; --fg: #1d1d1b; --muted: #6b6b66; --line: #dcdcd6; --accent: #1f6feb; --ok: #1a7f37; --err: #cf222e; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161615; --fg: #ededea; --muted: #9a9a94; --line: #34342f; --accent: #58a6ff; --ok: #3fb950; --err: #f85149; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 32px 16px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.lead { color: var(--muted); margin: 0 0 24px; }
+  #drop { display: block; border: 2px dashed var(--line); border-radius: 12px; padding: 40px 16px; text-align: center; cursor: pointer; }
+  #drop.over { border-color: var(--accent); }
+  #drop input { display: none; }
+  ul { list-style: none; padding: 0; margin: 24px 0 0; }
+  li { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+  .row { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  .name { font-weight: 600; word-break: break-all; }
+  .meta { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  progress { width: 100%; height: 8px; margin-top: 8px; accent-color: var(--accent); }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  button { font: inherit; border: 1px solid var(--line); background: transparent; color: var(--fg); border-radius: 8px; padding: 2px 10px; cursor: pointer; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>xferkit browser demo</h1>
+  <p class="lead">Files are uploaded in parallel parts, verified with SHA-256, and resume after a reload or a dropped connection: just drop the same file again.</p>
+  <label id="drop">
+    <input id="pick" type="file" multiple>
+    <strong>Drop files here</strong> or click to choose
+  </label>
+  <ul id="list"></ul>
+</main>
+<script type="module">
+  import { upload } from "/xferkit.mjs";
+
+  const list = document.getElementById("list");
+  const drop = document.getElementById("drop");
+  const fmt = (n) => n >= 2 ** 30 ? (n / 2 ** 30).toFixed(2) + " GiB" : (n / 2 ** 20).toFixed(1) + " MiB";
+
+  async function send(file) {
+    const li = document.createElement("li");
+    li.innerHTML = `<div class="row"><span class="name"></span><span class="meta">starting…</span></div>
+                    <progress max="1" value="0"></progress>
+                    <div class="row"><span class="meta status"></span><button>Cancel</button></div>`;
+    li.querySelector(".name").textContent = file.name;
+    list.prepend(li);
+    const meta = li.querySelector(".meta"), bar = li.querySelector("progress");
+    const status = li.querySelector(".status"), cancel = li.querySelector("button");
+    const controller = new AbortController();
+    cancel.onclick = () => controller.abort();
+    const started = performance.now();
+    try {
+      const { grant, baseUrl } = await (await fetch("/demo/grant")).json();
+      const result = await upload(file, {
+        baseUrl, grant, signal: controller.signal, concurrency: 4,
+        onProgress: (p) => {
+          bar.value = p.fraction;
+          const secs = (performance.now() - started) / 1000;
+          meta.textContent = `${fmt(p.bytesDone)} / ${fmt(p.bytesTotal)} · ${fmt(p.bytesDone / Math.max(secs, 0.001))}/s`;
+        },
+      });
+      const { url } = await (await fetch(`/demo/link/${result.uploadId}`)).json();
+      status.innerHTML = `<span class="ok">✓ verified</span>${result.resumed ? " (resumed)" : ""} · <a href="${url}">download link (10 min)</a>`;
+      cancel.remove();
+    } catch (error) {
+      const resumable = error.name === "AbortError";
+      status.innerHTML = `<span class="err">${resumable ? "cancelled — drop the file again to resume" : error.message}</span>`;
+      cancel.remove();
+    }
+  }
+
+  document.getElementById("pick").onchange = (e) => [...e.target.files].forEach(send);
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add("over"); };
+  drop.ondragleave = () => drop.classList.remove("over");
+  drop.ondrop = (e) => { e.preventDefault(); drop.classList.remove("over"); [...e.dataTransfer.files].forEach(send); };
+</script>
+</body>
+</html>
