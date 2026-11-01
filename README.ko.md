@@ -1,6 +1,6 @@
 # xferkit
 
-[English](README.md) | **한국어**
+[English](https://github.com/SeaViewer91/xferkit/blob/main/README.md) | **한국어**
 
 **파이썬 서버용 분할·이어받기 대용량 파일 업로드/다운로드 SDK — FastAPI 바로 연동, 브라우저 클라이언트 포함.**
 
@@ -66,7 +66,7 @@ mount_browser_client(app)                       # /xferkit.mjs 제공
 add_cors(app, ["https://app.example.com"])      # 웹앱이 다른 출처(origin)에 있을 때
 ```
 
-방치된 세션, 만료된 기록, 강제 종료로 남은 흔적을 지우려면 `manager.cleanup_expired()`를 주기적으로(예: 1시간마다) 호출하세요. 드래그 앤 드롭 브라우저 데모가 포함된 실행 예제는 [examples/server_app.py](examples/server_app.py)에 있습니다.
+방치된 세션, 만료된 기록, 강제 종료로 남은 흔적을 지우려면 `manager.cleanup_expired()`를 주기적으로(예: 1시간마다) 호출하세요. 드래그 앤 드롭 브라우저 데모가 포함된 실행 예제는 [examples/server_app.py](https://github.com/SeaViewer91/xferkit/blob/main/examples/server_app.py)에 있습니다.
 
 ### 접근 제어
 
@@ -159,7 +159,7 @@ const batch = await uploadFiles(folderInput.files, { baseUrl, grant, onProgress 
 dropZone.ondrop = async (e) => { e.preventDefault(); await uploadFiles(await filesFromDataTransfer(e.dataTransfer), { baseUrl, grant }); };
 ```
 
-파이썬 클라이언트와 같은 것을 보장합니다. 병렬 파트 전송, 파트별 SHA-256, 합성 체크섬 검증, 새로고침이나 `AbortController.abort()` 이후 이어받기, 멱등성 키(파이썬과 공유)를 지원합니다. 자세한 내용은 [clients/js](clients/js/README.md)를 참고하세요.
+파이썬 클라이언트와 같은 것을 보장합니다. 병렬 파트 전송, 파트별 SHA-256, 합성 체크섬 검증, 새로고침이나 `AbortController.abort()` 이후 이어받기, 멱등성 키(파이썬과 공유)를 지원합니다. 자세한 내용은 [clients/js](https://github.com/SeaViewer91/xferkit/blob/main/clients/js/README.md)를 참고하세요.
 
 ## CLI
 
@@ -186,7 +186,7 @@ Range 다운로드는 `xferkit.server.plan_file_response()`와 `iter_file_range(
 
 ## 동작 방식
 
-전송 프로토콜은 [docs/PROTOCOL.md](docs/PROTOCOL.md)에, 저장 구조·보안 모델과 각각의 보장 사항은 [docs/DESIGN.md](docs/DESIGN.md)에 정리되어 있습니다.
+전송 프로토콜은 [docs/PROTOCOL.md](https://github.com/SeaViewer91/xferkit/blob/main/docs/PROTOCOL.md)에, 저장 구조·보안 모델과 각각의 보장 사항은 [docs/DESIGN.md](https://github.com/SeaViewer91/xferkit/blob/main/docs/DESIGN.md)에 정리되어 있습니다.
 
 ## 개발 환경
 
@@ -198,7 +198,7 @@ ruff check src tests && ruff format --check src tests
 cd clients/js && npm install && npm run build    # 브라우저 클라이언트를 수정한 뒤
 ```
 
-부하 테스트(약 10MB 이미지 수천 장, 동시 세션 10개, 장애 주입)는 [benchmarks/load](benchmarks/load/README.md)를 참고하세요.
+부하 테스트(약 10MB 이미지 수천 장, 동시 세션 10개, 장애 주입)는 [benchmarks/load](https://github.com/SeaViewer91/xferkit/blob/main/benchmarks/load/README.md)를 참고하세요.
 
 ## 라이선스
 
@@ -206,4 +206,4 @@ MIT
 
 ---
 
-> 이 문서는 [README.md](README.md)(영문)의 번역본입니다. 내용을 바꿀 때는 두 파일을 함께 수정해 주세요.
+> 이 문서는 [README.md](https://github.com/SeaViewer91/xferkit/blob/main/README.md)(영문)의 번역본입니다. 내용을 바꿀 때는 두 파일을 함께 수정해 주세요.

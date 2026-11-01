@@ -1,6 +1,6 @@
 # xferkit
 
-**English** | [한국어](README.ko.md)
+**English** | [한국어](https://github.com/SeaViewer91/xferkit/blob/main/README.ko.md)
 
 **Chunked, resumable large-file upload/download SDK for Python servers — FastAPI-ready, with a browser client.**
 
@@ -66,7 +66,7 @@ mount_browser_client(app)                       # serves /xferkit.mjs
 add_cors(app, ["https://app.example.com"])      # if the web app lives on another origin
 ```
 
-Call `manager.cleanup_expired()` periodically (e.g. hourly) to remove abandoned sessions, expired records and crash leftovers. See [examples/server_app.py](examples/server_app.py) for a runnable server with a drag-and-drop browser demo.
+Call `manager.cleanup_expired()` periodically (e.g. hourly) to remove abandoned sessions, expired records and crash leftovers. See [examples/server_app.py](https://github.com/SeaViewer91/xferkit/blob/main/examples/server_app.py) for a runnable server with a drag-and-drop browser demo.
 
 ### Access control
 
@@ -159,7 +159,7 @@ const batch = await uploadFiles(folderInput.files, { baseUrl, grant, onProgress 
 dropZone.ondrop = async (e) => { e.preventDefault(); await uploadFiles(await filesFromDataTransfer(e.dataTransfer), { baseUrl, grant }); };
 ```
 
-Same guarantees as the Python client: parallel parts, SHA-256 per part, composite verification, resume after reload or `AbortController.abort()`, idempotency keys (shared with Python). See [clients/js](clients/js/README.md).
+Same guarantees as the Python client: parallel parts, SHA-256 per part, composite verification, resume after reload or `AbortController.abort()`, idempotency keys (shared with Python). See [clients/js](https://github.com/SeaViewer91/xferkit/blob/main/clients/js/README.md).
 
 ## CLI
 
@@ -186,7 +186,7 @@ with manager.open_part(upload_id, index) as sink:
 
 ## How it works
 
-See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the wire protocol and [docs/DESIGN.md](docs/DESIGN.md) for the storage design, the security model and their guarantees.
+See [docs/PROTOCOL.md](https://github.com/SeaViewer91/xferkit/blob/main/docs/PROTOCOL.md) for the wire protocol and [docs/DESIGN.md](https://github.com/SeaViewer91/xferkit/blob/main/docs/DESIGN.md) for the storage design, the security model and their guarantees.
 
 ## Development
 
@@ -198,9 +198,9 @@ ruff check src tests && ruff format --check src tests
 cd clients/js && npm install && npm run build    # after changing the browser client
 ```
 
-Load test (thousands of ~10 MB images, 10 concurrent sessions, fault injection): see [benchmarks/load](benchmarks/load/README.md).
+Load test (thousands of ~10 MB images, 10 concurrent sessions, fault injection): see [benchmarks/load](https://github.com/SeaViewer91/xferkit/blob/main/benchmarks/load/README.md).
 
-The README is maintained in English and Korean ([README.ko.md](README.ko.md)); please update both when changing it.
+The README is maintained in English and Korean ([README.ko.md](https://github.com/SeaViewer91/xferkit/blob/main/README.ko.md)); please update both when changing it.
 
 ## License
 

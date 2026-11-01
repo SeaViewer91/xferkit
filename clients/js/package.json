@@ -6,10 +6,17 @@
   "author": "SeaViewer91",
   "repository": {
     "type": "git",
-    "url": "https://github.com/SeaViewer91/xferkit.git",
+    "url": "git+https://github.com/SeaViewer91/xferkit.git",
     "directory": "clients/js"
   },
-  "keywords": ["upload", "download", "resumable", "chunked-upload", "multipart", "range-requests"],
+  "keywords": [
+    "upload",
+    "download",
+    "resumable",
+    "chunked-upload",
+    "multipart",
+    "range-requests"
+  ],
   "type": "module",
   "main": "./dist/xferkit.mjs",
   "module": "./dist/xferkit.mjs",
@@ -20,7 +27,12 @@
       "import": "./dist/xferkit.mjs"
     }
   },
-  "files": ["dist", "src", "README.md"],
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "sideEffects": false,
   "scripts": {
     "build": "npm run typecheck && npm run bundle && npm run types && npm run vendor",
@@ -32,5 +44,12 @@
   "devDependencies": {
     "esbuild": "0.25.12",
     "typescript": "5.9.3"
+  },
+  "homepage": "https://github.com/SeaViewer91/xferkit/tree/main/clients/js#readme",
+  "bugs": {
+    "url": "https://github.com/SeaViewer91/xferkit/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

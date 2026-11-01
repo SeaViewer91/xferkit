@@ -1,0 +1,122 @@
+# Publishes a release to PyPI and npm when a version tag (v1.2.3) is pushed.
+#
+# No tokens are stored: both registries trust this workflow through OpenID
+# Connect ("trusted publishing"). One-time setup is described in RELEASING.md.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Versions and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Tag matches all package versions
+        run: python scripts/check_release_version.py "$GITHUB_REF_NAME"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]" playwright
+      - run: python -m playwright install --with-deps chromium
+      - run: ruff check src tests && ruff format --check src tests
+      - name: Build the browser client
+        working-directory: clients/js
+        run: |
+          npm ci
+          npm run build
+      - name: Bundled browser client in the Python package is up to date
+        run: git diff --exit-code src/xferkit/static/xferkit.mjs
+      - name: Tests (including real Chromium)
+        run: pytest -q
+
+  build-python:
+    name: Build Python package
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: python -m twine check --strict dist/*
+      - name: The wheel installs and works on its own
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install "$(ls dist/*.whl)[all]"
+          cd /tmp && /tmp/smoke/bin/python -c "import xferkit, xferkit.client, xferkit.server.s3; print(xferkit.__version__)"
+          /tmp/smoke/bin/xferkit --version
+      - uses: actions/upload-artifact@v5
+        with:
+          name: python-dist
+          path: dist/
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build-python
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/xferkit
+    permissions:
+      id-token: write  # trusted publishing
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: python-dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true  # re-running a half-finished release is safe
+
+  publish-npm:
+    name: Publish to npm
+    needs: check
+    runs-on: ubuntu-latest
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/xferkit
+    permissions:
+      contents: read
+      id-token: write  # trusted publishing + provenance
+    defaults:
+      run:
+        working-directory: clients/js
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      # No registry-url here: setup-node would then write a token placeholder
+      # into .npmrc, which npm would use instead of trusted publishing.
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - run: npm install -g npm@latest  # trusted publishing needs npm >= 11.5.1
+      - run: npm ci
+      - run: npm run build
+      - name: Skip versions that are already on npm
+        id: published
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if npm view "xferkit@$version" version >/dev/null 2>&1; then
+            echo "xferkit@$version is already on npm, skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.published.outputs.skip != 'true'
+        run: npm publish --access public
