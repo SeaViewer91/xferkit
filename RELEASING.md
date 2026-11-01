@@ -1,37 +1,21 @@
 # Releasing
 
+xferkit is distributed from GitHub for now: users install a release tag with
+
+```
+pip install "xferkit[fastapi] @ git+https://github.com/SeaViewer91/xferkit.git@vX.Y.Z"
+```
+
+and load the browser client from the Python package (`mount_browser_client`)
+or from `https://cdn.jsdelivr.net/gh/SeaViewer91/xferkit@vX.Y.Z/src/xferkit/static/xferkit.mjs`.
+The bundled `src/xferkit/static/xferkit.mjs` is committed, so installing from
+git needs no Node.js.
+
 Pushing a tag `vX.Y.Z` runs [.github/workflows/release.yml](.github/workflows/release.yml):
 it checks that the tag matches every version number, runs all tests (including
-real Chromium), then publishes the Python package to PyPI and the browser
-client to npm. No tokens are stored anywhere: both registries trust that
-workflow through OpenID Connect ("trusted publishing").
-
-## One-time setup
-
-1. **GitHub environments.** In the repository: *Settings → Environments → New
-   environment*, create `pypi` and `npm`. Optionally add yourself as a
-   *required reviewer* to each, so every publish waits for your click.
-2. **PyPI.** Log in at https://pypi.org (enable 2FA), open
-   *Your account → Publishing → Add a new pending publisher* and enter:
-   PyPI project name `xferkit`, owner `SeaViewer91`, repository `xferkit`,
-   workflow `release.yml`, environment `pypi`. The project is created by the
-   first release.
-3. **npm.** npm only lets you configure trusted publishing for a package that
-   already exists, so the very first version is published by hand once:
-
-   ```bash
-   cd clients/js
-   npm login                      # account with 2FA
-   npm ci && npm run build
-   npm publish --access public    # asks for the 2FA code
-   ```
-
-   Then on https://www.npmjs.com/package/xferkit → *Settings → Trusted
-   publishing*, choose GitHub Actions: user `SeaViewer91`, repository
-   `xferkit`, workflow `release.yml`, environment `npm`. Afterwards set
-   *Publishing access* to "Require two-factor authentication and disallow
-   tokens". The release workflow skips npm versions that already exist, so the
-   hand-published first version does not break the first tagged release.
+real Chromium), builds the wheel and sdist, and creates a GitHub Release with
+them attached and the CHANGELOG section as release notes. Nothing is uploaded
+to PyPI or npm.
 
 ## Every release
 
@@ -41,16 +25,25 @@ workflow through OpenID Connect ("trusted publishing").
    checks all four.
 2. Rebuild the browser client if it changed (`cd clients/js && npm run build`),
    so the copy in `src/xferkit/static/` is current.
-3. Commit, push, wait for CI to pass, then tag:
+3. Update the version in the install lines of `README.md`, `README.ko.md` and
+   `clients/js/README.md`.
+4. Commit, push, wait for CI to pass, then tag:
 
    ```bash
    git tag vX.Y.Z
    git push origin vX.Y.Z
    ```
 
-4. Watch *Actions → Release*. If a publish job fails after the other one
-   succeeded, fix the cause and *Re-run failed jobs*: versions already
-   published are skipped.
+5. Check *Actions → Release* and the new entry under *Releases*.
 
-A version number can be published only once on PyPI (even after deleting it)
-and on npm, so fix mistakes with a new patch version.
+A tag that was used should not be moved: installs pinned to it would silently
+change. Fix mistakes with a new patch version.
+
+## Later: PyPI and npm
+
+The package metadata is ready for both registries (`python -m build` and
+`npm pack` produce clean packages). When publishing starts, add publish jobs
+using trusted publishing (no stored tokens): `pypa/gh-action-pypi-publish`
+with a PyPI "pending publisher" for `release.yml`, and `npm publish` with
+`id-token: write` after the first version was published by hand (npm can only
+trust a workflow for a package that already exists).

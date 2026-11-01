@@ -30,7 +30,13 @@ mount_browser_client(app)          # serves /xferkit.mjs
 </script>
 ```
 
-Or from npm (`npm install xferkit`) in a bundled app: `import { upload } from "xferkit"`.
+Or from a CDN, pinned to a release tag (no server-side change needed):
+
+```js
+import { upload } from "https://cdn.jsdelivr.net/gh/SeaViewer91/xferkit@v0.1.0/src/xferkit/static/xferkit.mjs";
+```
+
+For a bundled app, copy `src/xferkit/static/xferkit.mjs` from a release into your sources. The package is not on npm yet.
 
 ## Upload
 

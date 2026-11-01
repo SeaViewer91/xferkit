@@ -17,14 +17,18 @@ xferkit은 수십~수백 GB 단위의 대용량 파일을 일반 HTTP로 주고�
 - **프레임워크에 독립적인 코어.** 서버 코어는 외부 의존성이 없습니다. FastAPI는 연동 방식 중 하나일 뿐이고, Flask·Django·aiohttp나 직접 만든 서버에서도 같은 `UploadManager`를 호출하면 됩니다.
 - **멀티 워커 환경에서 안전.** 데이터베이스 없이도 uvicorn/gunicorn 워커 여러 개가 같은 저장 폴더를 공유할 수 있습니다.
 
+xferkit은 GitHub에서 바로 설치합니다(아직 PyPI에는 없습니다). 필요한 extra를 고르고 릴리스 태그를 지정하세요.
+
 ```
-pip install "xferkit[fastapi]"   # FastAPI 서버
-pip install "xferkit[client]"    # 파이썬 클라이언트 + CLI
-pip install "xferkit[s3]"        # S3 호환 저장소 백엔드(boto3)
-pip install "xferkit[all]"       # 위의 전부
+pip install "xferkit[fastapi] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0"   # FastAPI 서버
+pip install "xferkit[client] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0"    # 파이썬 클라이언트 + CLI
+pip install "xferkit[s3] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0"        # S3 호환 저장소(boto3)
+pip install "xferkit[all] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0"       # 위의 전부
 ```
 
-Python 3.10 이상이 필요합니다. 브라우저 클라이언트는 파이썬 패키지에 함께 들어 있습니다(npm에는 `xferkit`으로 배포).
+`requirements.txt`에는 `xferkit[fastapi] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0` 형식으로 적습니다. 각 [릴리스](https://github.com/SeaViewer91/xferkit/releases)에는 wheel 파일도 첨부됩니다.
+
+Python 3.10 이상이 필요합니다(Node.js는 필요 없음). 브라우저 클라이언트는 파이썬 패키지에 함께 들어 있습니다. [브라우저 클라이언트](#브라우저-클라이언트) 절을 참고하세요.
 
 ## 서버 (FastAPI)
 

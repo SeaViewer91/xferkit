@@ -17,14 +17,18 @@ xferkit moves very large files (tens or hundreds of GB) over plain HTTP:
 - **Framework-agnostic core.** The server core has zero dependencies. FastAPI is one integration; Flask, Django, aiohttp or your own server can call the same `UploadManager`.
 - **Multi-worker safe.** Several uvicorn/gunicorn workers can share one storage directory without a database.
 
+xferkit is installed straight from GitHub (it is not on PyPI yet). Pick the extras you need and pin a release tag:
+
 ```
-pip install "xferkit[fastapi]"   # server with FastAPI
-pip install "xferkit[client]"    # Python client + CLI
-pip install "xferkit[s3]"        # S3-compatible storage backend (boto3)
-pip install "xferkit[all]"       # all of the above
+pip install "xferkit[fastapi] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0"   # server with FastAPI
+pip install "xferkit[client] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0"    # Python client + CLI
+pip install "xferkit[s3] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0"        # S3-compatible storage (boto3)
+pip install "xferkit[all] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0"       # all of the above
 ```
 
-Requires Python 3.10+. The browser client is bundled with the Python package (and published as `xferkit` on npm).
+In `requirements.txt`: `xferkit[fastapi] @ git+https://github.com/SeaViewer91/xferkit.git@v0.1.0`. Each [release](https://github.com/SeaViewer91/xferkit/releases) also has a wheel attached.
+
+Requires Python 3.10+ (no Node.js needed). The browser client is bundled with the Python package; see [Browser client](#browser-client).
 
 ## Server (FastAPI)
 

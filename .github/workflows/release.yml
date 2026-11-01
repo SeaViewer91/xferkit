@@ -1,7 +1,8 @@
-# Publishes a release to PyPI and npm when a version tag (v1.2.3) is pushed.
-#
-# No tokens are stored: both registries trust this workflow through OpenID
-# Connect ("trusted publishing"). One-time setup is described in RELEASING.md.
+# Creates a GitHub Release when a version tag (v1.2.3) is pushed: checks that
+# the tag matches every version number, runs all tests, builds the wheel and
+# sdist and attaches them to the release. Nothing is published to PyPI or npm
+# (see RELEASING.md); install from GitHub instead:
+#   pip install "xferkit[fastapi] @ git+https://github.com/SeaViewer91/xferkit.git@v1.2.3"
 
 name: Release
 
@@ -42,10 +43,12 @@ jobs:
       - name: Tests (including real Chromium)
         run: pytest -q
 
-  build-python:
-    name: Build Python package
+  release:
+    name: GitHub Release
     needs: check
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # create the release
     steps:
       - uses: actions/checkout@v6
         with:
@@ -62,61 +65,30 @@ jobs:
           /tmp/smoke/bin/pip install "$(ls dist/*.whl)[all]"
           cd /tmp && /tmp/smoke/bin/python -c "import xferkit, xferkit.client, xferkit.server.s3; print(xferkit.__version__)"
           /tmp/smoke/bin/xferkit --version
-      - uses: actions/upload-artifact@v5
-        with:
-          name: python-dist
-          path: dist/
-
-  publish-pypi:
-    name: Publish to PyPI
-    needs: build-python
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/xferkit
-    permissions:
-      id-token: write  # trusted publishing
-    steps:
-      - uses: actions/download-artifact@v6
-        with:
-          name: python-dist
-          path: dist/
-      - uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          skip-existing: true  # re-running a half-finished release is safe
-
-  publish-npm:
-    name: Publish to npm
-    needs: check
-    runs-on: ubuntu-latest
-    environment:
-      name: npm
-      url: https://www.npmjs.com/package/xferkit
-    permissions:
-      contents: read
-      id-token: write  # trusted publishing + provenance
-    defaults:
-      run:
-        working-directory: clients/js
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      # No registry-url here: setup-node would then write a token placeholder
-      # into .npmrc, which npm would use instead of trusted publishing.
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-      - run: npm install -g npm@latest  # trusted publishing needs npm >= 11.5.1
-      - run: npm ci
-      - run: npm run build
-      - name: Skip versions that are already on npm
-        id: published
+      - name: Release notes from CHANGELOG.md
         run: |
-          version=$(node -p "require('./package.json').version")
-          if npm view "xferkit@$version" version >/dev/null 2>&1; then
-            echo "xferkit@$version is already on npm, skipping"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          fi
-      - if: steps.published.outputs.skip != 'true'
-        run: npm publish --access public
+          python - "${GITHUB_REF_NAME#v}" > notes.md <<'EOF'
+          import re, sys
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          match = re.search(rf"^## {re.escape(sys.argv[1])}\b.*?\n(.*?)(?=^## \d|\Z)", text, re.M | re.S)
+          print(match.group(1).strip() if match else "")
+          EOF
+          cat >> notes.md <<EOF
+
+          ## Install
+
+          \`\`\`
+          pip install "xferkit[fastapi] @ git+https://github.com/${GITHUB_REPOSITORY}.git@${GITHUB_REF_NAME}"
+          \`\`\`
+
+          Browser client: \`https://cdn.jsdelivr.net/gh/${GITHUB_REPOSITORY}@${GITHUB_REF_NAME}/src/xferkit/static/xferkit.mjs\`
+          EOF
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "xferkit $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            --verify-tag
